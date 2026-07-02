@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 r"""
-pdf2md_mcp.py - Self-contained MCP (Model Context Protocol) stdio server for
+pdf-to-md.py - Self-contained MCP (Model Context Protocol) stdio server for
 Continue that converts PDFs in a folder to Markdown, including tables (both
 bordered and borderless).
 
@@ -42,7 +42,7 @@ Notes:
     "pdf2md": {
       "command": "python",
       "args": [
-        "C:\\path\\to\\pdf2md_mcp.py",
+        "C:\\path\\to\\pdf-to-md.py",
         "--input-dir",  "C:\\Reference\\PDFs",
         "--output-dir", "C:\\Reference\\Markdown"
       ],
@@ -71,7 +71,7 @@ echo with nested JSON, which silently drops the "arguments" object):
     {"jsonrpc":"2.0","id":2,"method":"tools/list"}
     {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"convert_all_pdfs","arguments":{}}}
     '@
-    $msgs | python C:\path\to\pdf2md_mcp.py --input-dir "C:\Reference\PDFs" --output-dir "C:\Reference\Markdown"
+    $msgs | python C:\path\to\pdf-to-md.py --input-dir "C:\Reference\PDFs" --output-dir "C:\Reference\Markdown"
 
 Expected: three JSON lines on stdout (initialize result, tool list, conversion
 summary). Diagnostics appear on stderr and never on stdout.
