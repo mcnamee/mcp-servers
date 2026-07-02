@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-outlook.py
+ms-outlook.py
 ==============
 
 A single-file MCP (Model Context Protocol) server that gives an LLM
