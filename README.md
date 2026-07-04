@@ -129,6 +129,18 @@ running, and logged into a profile.
 | `--check` | Connect to Outlook, print diagnostics + blacklist status to stderr, then exit (no server) |
 | `--version` | Print version and exit |
 
+Everything else is configured by editing the `USER CONFIGURATION` block at
+the top of `ms-outlook.py` directly (there are no extra CLI flags/env vars
+for these):
+
+| Setting | Purpose |
+|---|---|
+| `BLACKLIST_TERMS` | Built-in list of classification/compliance terms that cause an item to be withheld from the AI entirely |
+| `BLACKLIST_MATCH_MODE` | `"word"` (default, whole-term match) or `"substring"` (for terms containing punctuation) |
+| `RESTRICT_DATE_FORMAT` | Locale-sensitive date format Outlook expects in its `Restrict()` filter — switch this if `outlook_get_calendar` returns zero events on a non-US-locale machine |
+| `MAX_BODY_CHARS` / `CALENDAR_HARD_CAP` / `SEARCH_SCAN_CAP` | Safety caps on body length / items scanned |
+| `SEARCH_ALL_FOLDERS` | Folder names (matched across every store) that `outlook_search_recent` searches — default `["Inbox", "Sent Items", "Archive"]`; use `outlook_list_folders` to see real folder names first |
+
 ```yaml
 mcpServers:
   - name: outlook
@@ -216,6 +228,9 @@ one or more of the tools the server exposes.
 2. "Search my inbox for anything from 'Jane Smith' about the contract renewal." → `outlook_search_emails`
 3. "Open that email from the vendor and summarise the key dates." → `outlook_get_email`
 4. "What's on my calendar for the next 7 days?" → `outlook_get_calendar`
+5. "What did I send last week?" → `outlook_list_sent_emails`
+6. "Find everything about the 'Acme renewal' across my Inbox, Sent Items and Archive from the last month." → `outlook_search_recent`
+7. "What are my actual Outlook folder names, so I can point the search at the right archive?" → `outlook_list_folders`
 
 ### ms-word.py
 

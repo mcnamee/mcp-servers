@@ -3,24 +3,21 @@
 ms-outlook.py
 ==============
 
-A single-file MCP (Model Context Protocol) server that gives an LLM
-read-only access to a locally installed *classic* Microsoft Outlook
-client (mail + calendar) on Windows, via COM automation.
+A single-file MCP (Model Context Protocol) server giving an LLM read-only
+access to a locally installed *classic* Microsoft Outlook client (mail +
+calendar) on Windows, via COM automation.
 
-Designed for an airgapped Windows endpoint where Outlook is installed,
-running, and logged into an on-premises Exchange profile. No network
-calls are made by this script itself; all access is local COM to the
-already-authenticated Outlook process.
+Designed for an airgapped Windows endpoint where Outlook is installed, running,
+and logged into an on-premises Exchange profile. This script makes NO network
+calls; all access is local COM to the already-authenticated Outlook process.
 
-Transport: newline-delimited JSON-RPC 2.0 over stdio (the standard MCP
-stdio transport, and what the VSCode Continue extension speaks).
+Transport: newline-delimited JSON-RPC 2.0 over stdio (standard MCP stdio
+transport, which the VSCode Continue extension speaks).
 
 DEPENDENCY
 ----------
-Requires pywin32 (provides win32com.client and pythoncom). This is the
-ONLY non-stdlib dependency. Install via your pip proxy:
-
-    pip install pywin32
+Requires pywin32 (win32com.client + pythoncom) - the ONLY non-stdlib
+dependency. Install via your pip proxy:  pip install pywin32
 
 REQUIREMENTS
 ------------
@@ -32,73 +29,101 @@ TOOLS EXPOSED (all read-only)
 - outlook_list_recent_emails : recent Inbox messages
 - outlook_search_emails      : search Inbox by subject / sender
 - outlook_get_email          : full body of one message by EntryID
-- outlook_get_calendar       : calendar events in a date range
-                               (recurring instances expanded)
+- outlook_get_calendar       : calendar events in a date range (recurring expanded)
+- outlook_list_sent_emails   : messages you SENT, in a date range (e.g. "what did I do last week")
+- outlook_search_recent      : all mail across Inbox/Archive/Sent in a date range (configurable)
+- outlook_list_folders       : list every mail folder across all stores (to configure the above)
 
 ==============================================================================
-CONTENT BLACKLIST  (COMPLIANCE FILTER)
+CONFIGURATION  -  all editable settings live in the "USER CONFIGURATION" block
+just below this docstring. Edit them there; nothing else needs changing.
 ==============================================================================
-Any email or calendar item whose content contains a blacklisted term is
-WITHHELD - it is never sent to the AI. This is a fail-safe control for
-classified / protectively-marked material that may not lawfully be processed
-by the AI (e.g. PROTECTED logs, CABINET material).
 
-Behaviour:
-- list / search : blocked items are silently omitted from results; a count of
-                  withheld items is shown (no subject/sender of blocked items
-                  is ever revealed).
-- get_email     : a blocked message returns a generic refusal, not its content.
-- calendar      : blocked events are omitted; a withheld count is shown.
-- The matched term is NEVER shown to the AI (that would leak the marking). It
-  is logged to STDERR only, for your local audit.
-- FAIL-SAFE: if an item's subject or body cannot be read to verify it is clean,
-  the item is treated as BLOCKED.
+1. BLACKLIST_TERMS  (content compliance filter)
+   Any email or calendar item whose content contains a blacklisted term is
+   WITHHELD - never sent to the AI. Use it for classified / protectively-marked
+   material that may not lawfully be processed by the AI.
+   - list / search : blocked items are omitted; a count of withheld items is
+                     shown (no subject/sender of a blocked item is ever revealed).
+   - get_email     : a blocked message returns a generic refusal, not content.
+   - calendar      : blocked events are omitted; a withheld count is shown.
+   - The matched term is NEVER shown to the AI (that would leak the marking); it
+     is logged to STDERR only, for local audit.
+   - FAIL-SAFE: if an item's subject or body cannot be read (so it cannot be
+     cleared), the item is treated as BLOCKED.
+   Seed the list with PLAIN words (PROTECTED, SECRET, CABINET). In "word" mode
+   these are still caught inside bracketed markings like [SEC=PROTECTED]. Do NOT
+   add very common words (e.g. "OFFICIAL") unless you mean to block almost
+   everything. Replace the seeded examples with your real classification scheme.
 
-Configuration (edit BLACKLIST_TERMS below, and/or use --blacklist-file):
-- BLACKLIST_TERMS  : the built-in list of terms (edit to suit your scheme).
-- --blacklist-file : optional path to a file of EXTRA terms, one per line,
-                     '#' starts a comment. File terms are ADDED to the built-in
-                     list (never reduce it).
-- BLACKLIST_MATCH_MODE :
-    "word"      - matches whole terms only. "SECRET" is caught inside
-                  "[SEC=SECRET]" but NOT inside "secretary". Best for plain
-                  classification words. (default)
-    "substring" - matches anywhere. Use only when a term itself contains
-                  punctuation (e.g. "[SEC=PROTECTED]") that word mode misses.
+2. BLACKLIST_MATCH_MODE
+   - "word"      : whole-term match. "SECRET" is caught inside "[SEC=SECRET]"
+                   but NOT inside "secretary". Best for plain words. (default)
+   - "substring" : matches anywhere. Use only when a term itself contains
+                   punctuation (e.g. "[SEC=PROTECTED]") that word mode misses.
+   Matching is always case-insensitive.
 
-Matching is always case-insensitive. List PLAIN words (PROTECTED, SECRET,
-CABINET); in "word" mode these are still caught inside bracketed markings such
-as [SEC=PROTECTED]. Do NOT add very common words (e.g. "OFFICIAL") unless you
-intend to block almost everything.
+3. RESTRICT_DATE_FORMAT  (LOCALE-SENSITIVE - read this if calendar returns nothing)
+   Outlook's Restrict() date filter formats dates per the machine's regional
+   settings. Default is US (MM/DD/YYYY). If outlook_get_calendar returns ZERO
+   events on an Australian-locale machine, switch to a day-first format - the
+   alternatives are listed inline in the config block.
 
-USAGE
------
-- As an MCP server (normal mode): launched by the MCP client (e.g. Continue).
-  Run with no arguments (optionally --blacklist-file).
-- Connectivity check (run manually on the endpoint before wiring it in):
+4. Tunable caps (MAX_BODY_CHARS / CALENDAR_HARD_CAP / SEARCH_SCAN_CAP)
+   Safety/size limits. Lower MAX_BODY_CHARS if your local model has a small
+   context window. The other two are guard rails you can usually leave as-is.
 
-      python outlook_mcp.py --check
+5. SEARCH_ALL_FOLDERS  (which folders the combined outlook_search_recent covers)
+   A list of folder NAMES matched across every store in the profile (main
+   mailbox, online archive, mounted PST). Default: Inbox, Sent Items, Archive.
+   "Archive" is ambiguous - it may be a mailbox folder, an online archive, or a
+   PST - so run outlook_list_folders first to see what actually exists and set
+   this list to the real names. Note: matching is by name across ALL stores, so
+   if you have shared mailboxes with same-named folders they may be included;
+   each result is labelled with its store/folder so you can see the source.
 
-  Connects to Outlook, prints mailbox diagnostics and blacklist status to
-  stderr, then exits.
+EXTERNAL BLACKLIST FILE (optional)
+----------------------------------
+Instead of (or in addition to) editing BLACKLIST_TERMS, supply extra terms in a
+file via --blacklist-file. One term per line; '#' starts a comment. File terms
+are ADDED to the built-in list (they never reduce it). Example file contents:
 
-Example Continue config.yaml entry:
+    # outlook-blacklist.txt  - classification terms to withhold from the AI
+    PROTECTED
+    SECRET
+    TOP SECRET
+    CABINET
+    CABINET-IN-CONFIDENCE
 
+CONTINUE config.yaml ENTRY (copy/paste, adjust paths)
+-----------------------------------------------------
     mcpServers:
       - name: outlook
         command: python
         args:
           - C:\\path\\to\\outlook_mcp.py
-          - --blacklist-file
+          - --blacklist-file          # optional
           - C:\\config\\outlook-blacklist.txt
         env:
           PYTHONUTF8: "1"
 
-IMPORTANT (matches known stdio-on-Windows pitfalls):
+USAGE / TESTING
+---------------
+- As an MCP server (normal mode): launched by the MCP client. Run with no
+  arguments (optionally --blacklist-file).
+- Connectivity check (run manually on the endpoint before wiring it in):
+
+      python outlook_mcp.py --check
+
+  Connects to Outlook and prints mailbox diagnostics + blacklist status to
+  stderr, then exits.
+
+IMPORTANT (stdio-on-Windows pitfalls)
+-------------------------------------
 - ALL diagnostic output goes to stderr. Anything on stdout that is not a
   JSON-RPC message corrupts the protocol stream.
-- Set PYTHONUTF8=1 in the launching environment so stdout is UTF-8 and Unicode
-  subjects do not crash on the default Windows cp1252 codec.
+- Set PYTHONUTF8=1 in the launching environment (see config.yaml above) so
+  stdout is UTF-8 and Unicode subjects do not crash on cp1252.
 """
 
 import os
@@ -108,6 +133,47 @@ import json
 import argparse
 import datetime
 import traceback
+
+
+# ============================================================================
+# USER CONFIGURATION  -  EDIT THIS BLOCK  (see the docstring above for detail)
+# ============================================================================
+
+# --- 1. Content blacklist: terms that cause an item to be withheld from the AI.
+#        Seeded with example AU-style markings; REPLACE with your real scheme.
+BLACKLIST_TERMS = [
+    "PROTECTED",
+    "SECRET",
+    "TOP SECRET",
+    "CABINET",
+    "CABINET-IN-CONFIDENCE",
+]
+
+# --- 2. How blacklist terms are matched: "word" (default) or "substring".
+BLACKLIST_MATCH_MODE = "word"
+
+# --- 3. Calendar date filter format (LOCALE-SENSITIVE). If outlook_get_calendar
+#        returns nothing on an AU-locale machine, switch to one of the alternatives.
+RESTRICT_DATE_FORMAT = "%m/%d/%Y %I:%M %p"          # US:  MM/DD/YYYY hh:mm AM/PM (default)
+# RESTRICT_DATE_FORMAT = "%d/%m/%Y %I:%M %p"        # AU:  DD/MM/YYYY hh:mm AM/PM   <- try this
+# RESTRICT_DATE_FORMAT = "%d/%m/%Y %H:%M"           # AU 24-hour, no AM/PM          <- or this
+
+# --- 4. Tunable caps.
+MAX_BODY_CHARS = 20000      # truncate very long email bodies for the LLM
+CALENDAR_HARD_CAP = 1000    # ceiling on calendar items iterated (anti-runaway)
+SEARCH_SCAN_CAP = 500       # ceiling on raw search hits scanned
+
+# --- 5. Folders included in the combined outlook_search_recent tool. Matched by
+#        folder NAME (case-insensitive) across EVERY mailbox/store in the profile,
+#        including an online (In-Place) archive or a mounted archive.pst. Run the
+#        outlook_list_folders tool to see the exact names available, then edit this
+#        list to match your setup. (The separate outlook_list_sent_emails tool is
+#        unaffected by this list.)
+SEARCH_ALL_FOLDERS = ["Inbox", "Sent Items", "Archive"]
+
+# ============================================================================
+# END USER CONFIGURATION  -  you should not need to edit below this line
+# ============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -137,47 +203,25 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Outlook configuration constants
+# Internal constants (not user configuration)
 # ---------------------------------------------------------------------------
-
 OL_FOLDER_INBOX = 6
+OL_FOLDER_SENT = 5
 OL_FOLDER_CALENDAR = 9
 OL_CLASS_MAIL = 43  # olMail
 
-# >>> LOCALE-SENSITIVE SETTING - READ THIS IF CALENDAR RETURNS NOTHING <<<
-# Outlook's Restrict() date filter formats dates per the machine's regional
-# settings. The line below uses the US format (MM/DD/YYYY). If
-# outlook_get_calendar returns ZERO events on an Australian-locale machine,
-# switch to the day-first alternative.
-RESTRICT_DATE_FORMAT = "%m/%d/%Y %I:%M %p"          # US:  MM/DD/YYYY hh:mm AM/PM
-# RESTRICT_DATE_FORMAT = "%d/%m/%Y %I:%M %p"        # AU:  DD/MM/YYYY hh:mm AM/PM  <- try this
-# RESTRICT_DATE_FORMAT = "%d/%m/%Y %H:%M"           # AU 24-hour, no AM/PM         <- or this
+# Ceiling on Sent Items scanned when listing by date. Items are sorted
+# newest-first and iteration stops as soon as it passes the start of the
+# window, so a recent window is reached immediately; this only bounds
+# pathological queries for very old windows in a huge Sent folder.
+SENT_SCAN_CAP = 5000
 
-MAX_BODY_CHARS = 20000
-CALENDAR_HARD_CAP = 1000
-SEARCH_SCAN_CAP = 500
-
-
-# ====================== CONTENT BLACKLIST (COMPLIANCE FILTER) =======================
-# See the docblock at the top of this file for full behaviour. Edit this list to
-# match your organisation's classification terms.
-BLACKLIST_TERMS = [
-    "PROTECTED",
-    "SECRET",
-    "TOP SECRET",
-    "CABINET",
-    "CABINET-IN-CONFIDENCE",
-]
-BLACKLIST_MATCH_MODE = "word"   # "word" (default) or "substring"
-# ===================================================================================
+# PR_TRANSPORT_MESSAGE_HEADERS (Unicode) - full internet headers, which carry
+# the authoritative protective marking (e.g. X-Protective-Marking).
+PROP_TRANSPORT_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
 
 # Compiled at startup by build_blacklist(); None means no filtering is active.
 _BLACKLIST_RE = None
-
-# PR_TRANSPORT_MESSAGE_HEADERS (Unicode) - the full internet headers, which
-# carry the authoritative protective marking (e.g. X-Protective-Marking) on
-# many enterprise/government mail systems.
-PROP_TRANSPORT_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +230,8 @@ PROP_TRANSPORT_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
 
 def build_blacklist(extra_terms=None):
     """
-    Compile BLACKLIST_TERMS (plus any extra_terms) into a single regex.
-    Sets the module-level _BLACKLIST_RE. Logs the active status to stderr.
+    Compile BLACKLIST_TERMS (plus any extra_terms) into a single regex and set
+    the module-level _BLACKLIST_RE. Logs the active status to stderr.
     """
     global _BLACKLIST_RE
 
@@ -214,8 +258,8 @@ def build_blacklist(extra_terms=None):
     if BLACKLIST_MATCH_MODE == "substring":
         pattern = "(?:" + "|".join(escaped) + ")"
     else:
-        # \b on each side: whole-term match. Catches "SECRET" inside
-        # "[SEC=SECRET]" (brackets/equals are non-word chars) but not "secretary".
+        # \b on each side: whole-term match. Catches "SECRET" inside "[SEC=SECRET]"
+        # (brackets/equals are non-word chars) but not "secretary".
         pattern = r"\b(?:" + "|".join(escaped) + r")\b"
 
     _BLACKLIST_RE = re.compile(pattern, re.IGNORECASE)
@@ -247,9 +291,8 @@ def email_block_reason(item):
     """
     Decide whether a mail item must be withheld from the AI.
 
-    Returns the matched term (str) if the item is BLOCKED, else None.
-    Fail-safe: if Subject or Body cannot be read (so the item cannot be cleared),
-    it is treated as BLOCKED.
+    Returns the matched term (str) if BLOCKED, else None. Fail-safe: if Subject
+    or Body cannot be read (so the item cannot be cleared), treat as BLOCKED.
     """
     if _BLACKLIST_RE is None:
         return None
@@ -371,6 +414,87 @@ def parse_date(value, fallback):
     if not value:
         return fallback
     return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _com_to_naive(value):
+    """Convert a COM/pywintypes datetime to a naive Python datetime, or None."""
+    try:
+        return datetime.datetime(
+            value.year, value.month, value.day,
+            value.hour, value.minute, value.second,
+        )
+    except Exception:
+        return None
+
+
+def item_received(item):
+    """The item's ReceivedTime as a naive datetime, or None."""
+    try:
+        return _com_to_naive(item.ReceivedTime)
+    except Exception:
+        return None
+
+
+def item_best_datetime(item):
+    """Best available date for an item: ReceivedTime, else SentOn, else None."""
+    dt = item_received(item)
+    if dt is None:
+        try:
+            dt = _com_to_naive(item.SentOn)
+        except Exception:
+            dt = None
+    return dt
+
+
+def _walk_folders(folder, prefix, out, depth=0):
+    """Recursively collect (path, folder_object) pairs beneath `folder`."""
+    if depth > 20:  # guard against pathological nesting / loops
+        return
+    try:
+        subfolders = folder.Folders
+    except Exception:
+        return
+    for sub in subfolders:
+        try:
+            name = sub.Name
+        except Exception:
+            continue
+        path = prefix + "/" + name
+        out.append((path, sub))
+        _walk_folders(sub, path, out, depth + 1)
+
+
+def all_mail_folders():
+    """
+    Return a list of (path, folder_object) for every folder across every store
+    in the profile (main mailbox, online archive, mounted PSTs).
+    """
+    ns = get_namespace()
+    out = []
+    try:
+        stores = ns.Stores
+    except Exception:
+        stores = None
+    if stores is None:
+        return out
+    for store in stores:
+        try:
+            root = store.GetRootFolder()
+            store_name = store.DisplayName
+        except Exception:
+            continue
+        _walk_folders(root, store_name, out)
+    return out
+
+
+def find_target_folders(names_lower):
+    """Return (label, folder) for folders whose LEAF name matches names_lower."""
+    matched = []
+    for path, folder in all_mail_folders():
+        leaf = path.rsplit("/", 1)[-1].lower()
+        if leaf in names_lower:
+            matched.append((path, folder))
+    return matched
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +662,6 @@ def tool_get_email(args):
     try:
         body = item.Body or ""
     except Exception:
-        # Should not happen (the scan above read Body), but stay safe.
         return ("This message cannot be displayed: its body could not be read and "
                 "therefore cannot be cleared for display.")
     truncated_note = ""
@@ -567,6 +690,236 @@ def tool_get_email(args):
         body + truncated_note,
     ]
     return "\n".join(parts)
+
+
+def tool_list_sent_emails(args):
+    """List messages from the Sent Items folder within a date range (newest first)."""
+    today = datetime.date.today()
+    try:
+        start_date = parse_date(args.get("start_date"), today - datetime.timedelta(days=7))
+        end_date = parse_date(args.get("end_date"), today)
+    except ValueError:
+        return "Error: dates must be in YYYY-MM-DD format."
+    if end_date < start_date:
+        return "Error: end_date is before start_date."
+    max_results = int(args.get("max_results", 100))
+
+    start_dt = datetime.datetime.combine(start_date, datetime.time(0, 0, 0))
+    end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
+
+    ns = get_namespace()
+    sent = ns.GetDefaultFolder(OL_FOLDER_SENT)
+    items = sent.Items
+    items.Sort("[SentOn]", True)  # True = descending (newest first)
+
+    lines = []
+    withheld = 0
+    iterated = 0
+    for item in items:
+        if len(lines) >= max_results or iterated >= SENT_SCAN_CAP:
+            break
+        iterated += 1
+        try:
+            if item.Class != OL_CLASS_MAIL:
+                continue
+            sent_on = item.SentOn
+            # Represent the COM time as a naive datetime for a day-range comparison.
+            sent_naive = datetime.datetime(
+                sent_on.year, sent_on.month, sent_on.day,
+                sent_on.hour, sent_on.minute, sent_on.second,
+            )
+        except Exception:
+            continue
+
+        # Sorted newest-first: skip anything newer than the window; once we reach
+        # an item older than the window, every later item is older too, so stop.
+        if sent_naive > end_dt:
+            continue
+        if sent_naive < start_dt:
+            break
+
+        # The content blacklist applies to sent mail as well.
+        reason = email_block_reason(item)
+        if reason:
+            withheld += 1
+            log("Withheld a sent message (blacklist match: {0}).".format(reason))
+            continue
+
+        try:
+            lines.append(
+                "- {sent} | To: {to}\n"
+                "    Subject : {subject}\n"
+                "    EntryID : {eid}".format(
+                    sent=fmt_dt(item.SentOn),
+                    to=(item.To or "(no recipient)"),
+                    subject=(item.Subject or "(no subject)"),
+                    eid=item.EntryID,
+                )
+            )
+        except Exception:
+            continue
+
+    note = ""
+    if withheld:
+        note = "\n\n[{0} sent message(s) withheld by the content blacklist.]".format(withheld)
+    if not lines:
+        if withheld:
+            return "No viewable sent messages between {0} and {1}. {2} withheld by the content blacklist.".format(
+                start_date, end_date, withheld)
+        return "No sent messages between {0} and {1}.".format(start_date, end_date)
+    header = "Sent messages {0} to {1} ({2} shown, newest first):".format(start_date, end_date, len(lines))
+    return header + "\n" + "\n".join(lines) + note
+
+
+def tool_list_folders(args):
+    """List every mail folder across all stores, with item counts, for discovery/config."""
+    max_lines = int(args.get("max_results", 300))
+    folders = all_mail_folders()
+    if not folders:
+        return "No folders found (could not enumerate Outlook stores)."
+    lines = []
+    for path, folder in folders:
+        if len(lines) >= max_lines:
+            lines.append("... (list truncated; raise max_results to see more)")
+            break
+        try:
+            count = folder.Items.Count
+        except Exception:
+            count = "?"
+        lines.append("- {0}  (items: {1})".format(path, count))
+    return "Outlook folders (store/path, with item counts):\n" + "\n".join(lines)
+
+
+def tool_search_recent(args):
+    """List mail across the configured folders (Inbox/Archive/Sent) within a date range."""
+    today = datetime.date.today()
+    try:
+        start_date = parse_date(args.get("start_date"), today - datetime.timedelta(days=7))
+        end_date = parse_date(args.get("end_date"), today)
+    except ValueError:
+        return "Error: dates must be in YYYY-MM-DD format."
+    if end_date < start_date:
+        return "Error: end_date is before start_date."
+    query = (args.get("query") or "").strip().lower()
+    max_results = int(args.get("max_results", 100))
+
+    start_dt = datetime.datetime.combine(start_date, datetime.time(0, 0, 0))
+    end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
+
+    names_lower = set(name.lower() for name in SEARCH_ALL_FOLDERS)
+    targets = find_target_folders(names_lower)
+    if not targets:
+        return ("No folders matched {0}. Run outlook_list_folders to see the folder "
+                "names available, then adjust SEARCH_ALL_FOLDERS.".format(SEARCH_ALL_FOLDERS))
+
+    collected = []  # tuples of (naive_datetime, folder_label, item)
+    withheld = 0
+    for label, folder in targets:
+        try:
+            items = folder.Items
+            items.Sort("[ReceivedTime]", True)  # newest first (see break-early note below)
+            sortable = True
+        except Exception:
+            items = folder.Items
+            sortable = False
+
+        scanned = 0
+        for item in items:
+            if scanned >= SENT_SCAN_CAP:
+                break
+            scanned += 1
+            try:
+                if item.Class != OL_CLASS_MAIL:
+                    continue
+            except Exception:
+                continue
+
+            received = item_received(item)
+            when = item_best_datetime(item)
+            if when is None:
+                continue
+            if when > end_dt:
+                continue
+            if when < start_dt:
+                # Sorted by ReceivedTime desc: if the SORT KEY is past the window,
+                # every later item is older too, so stop. Otherwise just skip (the
+                # item's usable date came from a fallback field, so ordering is not
+                # guaranteed and we must keep scanning).
+                if sortable and received is not None and received < start_dt:
+                    break
+                continue
+
+            # Optional free-text filter on subject / sender / recipient.
+            if query:
+                def _low(getter):
+                    try:
+                        return (getter() or "").lower()
+                    except Exception:
+                        return ""
+                if (query not in _low(lambda: item.Subject)
+                        and query not in _low(lambda: item.SenderName)
+                        and query not in _low(lambda: item.To)):
+                    continue
+
+            # Content blacklist applies here too.
+            reason = email_block_reason(item)
+            if reason:
+                withheld += 1
+                log("Withheld an item from {0} (blacklist match: {1}).".format(label, reason))
+                continue
+
+            collected.append((when, label, item))
+
+    collected.sort(key=lambda row: row[0], reverse=True)
+
+    lines = []
+    for when, label, item in collected[:max_results]:
+        try:
+            subject = item.Subject or "(no subject)"
+        except Exception:
+            subject = "(no subject)"
+        who = ""
+        try:
+            who = item.SenderName or ""
+        except Exception:
+            who = ""
+        if not who:  # sent items have no sender name; show recipient instead
+            try:
+                who = "To: " + (item.To or "")
+            except Exception:
+                who = ""
+        try:
+            eid = item.EntryID
+        except Exception:
+            eid = ""
+        lines.append(
+            "- {when} | {folder} | {who}\n"
+            "    Subject : {subject}\n"
+            "    EntryID : {eid}".format(
+                when=when.strftime("%Y-%m-%d %H:%M"),
+                folder=label,
+                who=(who or "(unknown)"),
+                subject=subject,
+                eid=eid,
+            )
+        )
+
+    note = ""
+    if withheld:
+        note += "\n\n[{0} item(s) withheld by the content blacklist.]".format(withheld)
+    if len(collected) > max_results:
+        note += "\n[Showing first {0} of {1} matches; narrow the dates or add a query.]".format(
+            max_results, len(collected))
+
+    if not lines:
+        if withheld:
+            return "No viewable emails between {0} and {1}. {2} withheld by the content blacklist.".format(
+                start_date, end_date, withheld)
+        return "No emails between {0} and {1} across {2}.".format(
+            start_date, end_date, ", ".join(SEARCH_ALL_FOLDERS))
+    header = "Emails {0} to {1} across {2} ({3} shown, newest first):".format(
+        start_date, end_date, ", ".join(SEARCH_ALL_FOLDERS), len(lines))
+    return header + "\n" + "\n".join(lines) + note
 
 
 def tool_get_calendar(args):
@@ -729,6 +1082,60 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "outlook_list_sent_emails",
+        "description": (
+            "List messages you SENT, within a date range (inclusive), newest first. "
+            "Returns sent time, recipients, and subject for each, plus an EntryID for "
+            "reading the full body with outlook_get_email. Useful for reviewing what "
+            "you did over a period, e.g. 'what did I send last week'. Dates are "
+            "YYYY-MM-DD; defaults to the last 7 days. Some messages may be withheld by "
+            "a content policy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "Start date, YYYY-MM-DD (default: 7 days ago)."},
+                "end_date": {"type": "string", "description": "End date, YYYY-MM-DD (default: today)."},
+                "max_results": {"type": "integer", "description": "Maximum messages to return (default 100)."},
+            },
+        },
+    },
+    {
+        "name": "outlook_search_recent",
+        "description": (
+            "List emails across MULTIPLE folders at once (by default Inbox, Sent Items, "
+            "and Archive) within a date range, newest first, merged into one list. Each "
+            "result is labelled with the folder it came from. Optionally filter by text "
+            "in the subject, sender, or recipient. Use this for 'all my email over the "
+            "last week' style questions. Dates are YYYY-MM-DD; defaults to the last 7 "
+            "days. Some items may be withheld by a content policy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "Start date, YYYY-MM-DD (default: 7 days ago)."},
+                "end_date": {"type": "string", "description": "End date, YYYY-MM-DD (default: today)."},
+                "query": {"type": "string", "description": "Optional text to match in subject, sender, or recipient."},
+                "max_results": {"type": "integer", "description": "Maximum emails to return (default 100)."},
+            },
+        },
+    },
+    {
+        "name": "outlook_list_folders",
+        "description": (
+            "List every mail folder across all Outlook stores (main mailbox, online "
+            "archive, mounted PSTs), with item counts. Use this to discover the exact "
+            "folder names available - especially to see what your 'Archive' really is - "
+            "so the combined search can be pointed at the right folders."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_results": {"type": "integer", "description": "Maximum folders to list (default 300)."},
+            },
+        },
+    },
 ]
 
 TOOL_DISPATCH = {
@@ -736,6 +1143,9 @@ TOOL_DISPATCH = {
     "outlook_search_emails": tool_search_emails,
     "outlook_get_email": tool_get_email,
     "outlook_get_calendar": tool_get_calendar,
+    "outlook_list_sent_emails": tool_list_sent_emails,
+    "outlook_search_recent": tool_search_recent,
+    "outlook_list_folders": tool_list_folders,
 }
 
 
@@ -744,7 +1154,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "outlook-mcp", "version": "1.1.0"}
+SERVER_INFO = {"name": "outlook-mcp", "version": "1.3.0"}
 
 
 def rpc_result(req_id, result):
