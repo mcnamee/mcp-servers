@@ -62,7 +62,8 @@ which take priority over the env vars).
 | `CONFLUENCE_CA_CERT` | `--ca-cert` | Path to a PEM CA bundle for an internal CA |
 | `CONFLUENCE_VERIFY_SSL=false` | `--insecure` | Disable TLS certificate verification |
 | `CONFLUENCE_TIMEOUT` | `--timeout` | Request timeout in seconds (default 30) |
-| `CONFLUENCE_MAX_BODY` | `--max-body` | Truncate page bodies to N chars, 0 = unlimited (default) |
+| `CONFLUENCE_MAX_BODY` | `--max-body` | Truncate page bodies to N chars, 0 = unlimited (default). Applies only to text returned to the model, not to files saved via `CONFLUENCE_KB_DIR` |
+| `CONFLUENCE_KB_DIR` | `--kb-dir` | If set, every page read is also saved as a Markdown file (`Confluence - <title>.md`, overwritten each time) into this folder — handy for feeding a local RAG knowledge base, e.g. alongside `knowledge-base.py` |
 
 ```yaml
 mcpServers:
@@ -72,6 +73,8 @@ mcpServers:
       - C:\path\to\confluence.py
       - --max-body
       - "20000"
+      - --kb-dir
+      - C:\reference-docs\confluence
     env:
       CONFLUENCE_BASE_URL: https://confluence.internal.example.com
       CONFLUENCE_TOKEN: your-personal-access-token
@@ -208,6 +211,7 @@ one or more of the tools the server exposes.
 3. "Pull up the full content of Confluence page 393217." → `confluence_get_page`
 4. "Open the 'Q3 Roadmap' page in the PROD space and summarise it." → `confluence_get_page_by_title`
 5. "List every page under the 'Engineering Handbook' in the DOCS space, direct children only." → `confluence_list_pages_under`
+6. "Pull the onboarding runbook into our local knowledge base for offline search." → `confluence_get_page` (or `confluence_get_page_by_title`), automatically mirrored to Markdown when `--kb-dir`/`CONFLUENCE_KB_DIR` is configured, so `knowledge-base.py`'s `reference_search`/`reference_get` can find it afterwards
 
 ### knowledge-base.py
 

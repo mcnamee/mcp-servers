@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-confluence.py - A single-file MCP (Model Context Protocol) server for
+confluence_mcp.py - A single-file MCP (Model Context Protocol) server for
 querying Confluence Data Center (tested against the 9.x v1 REST API) using
 only the Python 3 standard library.
 
@@ -26,6 +26,13 @@ Continue's `env:` block) and can be overridden by command-line arguments:
   CONFLUENCE_CA_CERT    path to a PEM CA bundle for an internal CA
   CONFLUENCE_TIMEOUT    request timeout in seconds (default: 30)
   CONFLUENCE_MAX_BODY   truncate page bodies to N chars (0 = unlimited, default 0)
+                        (this limit applies only to the text returned to the
+                        model; files saved to CONFLUENCE_KB_DIR are never truncated)
+  CONFLUENCE_KB_DIR     if set, every page that is read is also saved as a
+                        Markdown file into this folder, for feeding a local RAG
+                        knowledge base. Files are named 'Confluence - <title>.md'
+                        and overwritten if they already exist. Leave unset to
+                        disable saving.
 
 Diagnostic output goes ONLY to stderr. stdout is reserved for the JSON-RPC
 stream - writing anything else there would corrupt the protocol.
@@ -33,9 +40,11 @@ stream - writing anything else there would corrupt the protocol.
 
 import argparse
 import base64
+import datetime
 import html.parser
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -43,7 +52,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "confluence-mcp"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 # Protocol version we default to if the client does not send one. We echo the
 # client's requested version when possible (see handle_initialize) so that we
 # stay compatible with whatever the host negotiated.
@@ -135,6 +144,234 @@ def html_to_text(raw):
         return raw
 
 
+class _MarkdownExtractor(html.parser.HTMLParser):
+    """
+    Convert Confluence storage-format XHTML into reasonable Markdown.
+
+    This is a best-effort converter aimed at RAG ingestion, not a pixel-perfect
+    renderer. It handles the common structural elements (headings, paragraphs,
+    lists, bold/italic, links, inline code, code blocks, block quotes, rules and
+    tables). Confluence macros (<ac:...>) are not interpreted, but their inner
+    text - including code-macro CDATA bodies - is preserved. Text is not
+    Markdown-escaped, so the occasional literal '*' may look like emphasis; that
+    is a deliberate trade-off to keep the captured text faithful for search.
+    """
+
+    _SKIP_TAGS = {"script", "style"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip_depth = 0
+        self._in_pre = 0
+        self._list_stack = []      # 'ul' / 'ol' per nesting level
+        self._ol_counters = []     # running item number per ordered-list level
+        self._href_stack = []      # href per currently-open <a>
+        # Table buffering (only the outermost table is rendered as a grid)
+        self._table_depth = 0
+        self._rows = None          # list of cell-lists for the current table
+        self._row = None           # current row (list of cell strings)
+        self._cell = None          # buffer for the current cell, or None
+
+    def _emit(self, s):
+        # Route text either into the current table cell or the main output.
+        if self._cell is not None:
+            self._cell.append(s)
+        else:
+            self.parts.append(s)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag == "br":
+            self._emit("\n" if self._in_pre else "  \n")
+        elif tag == "p":
+            self._emit("\n\n")
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._emit("\n\n" + "#" * int(tag[1]) + " ")
+        elif tag in ("strong", "b") and not self._in_pre:
+            self._emit("**")
+        elif tag in ("em", "i") and not self._in_pre:
+            self._emit("*")
+        elif tag == "code" and not self._in_pre:
+            self._emit("`")
+        elif tag == "pre":
+            self._in_pre += 1
+            self._emit("\n\n```\n")
+        elif tag == "blockquote":
+            self._emit("\n\n> ")
+        elif tag == "hr":
+            self._emit("\n\n---\n\n")
+        elif tag == "a":
+            href = ""
+            for key, val in attrs:
+                if key == "href":
+                    href = val or ""
+            self._href_stack.append(href)
+            self._emit("[")
+        elif tag == "ul":
+            self._list_stack.append("ul")
+        elif tag == "ol":
+            self._list_stack.append("ol")
+            self._ol_counters.append(0)
+        elif tag == "li":
+            indent = "  " * max(0, len(self._list_stack) - 1)
+            if self._list_stack and self._list_stack[-1] == "ol":
+                self._ol_counters[-1] += 1
+                marker = "{}. ".format(self._ol_counters[-1])
+            else:
+                marker = "- "
+            self._emit("\n" + indent + marker)
+        elif tag == "table":
+            self._table_depth += 1
+            if self._table_depth == 1:
+                self._rows = []
+        elif tag == "tr":
+            if self._rows is not None:
+                self._row = []
+        elif tag in ("td", "th"):
+            if self._row is not None:
+                self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP_TAGS:
+            if self._skip_depth:
+                self._skip_depth -= 1
+            return
+        if self._skip_depth:
+            return
+        if tag == "p":
+            self._emit("\n\n")
+        elif tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._emit("\n\n")
+        elif tag in ("strong", "b") and not self._in_pre:
+            self._emit("**")
+        elif tag in ("em", "i") and not self._in_pre:
+            self._emit("*")
+        elif tag == "code" and not self._in_pre:
+            self._emit("`")
+        elif tag == "pre":
+            if self._in_pre:
+                self._in_pre -= 1
+            self._emit("\n```\n\n")
+        elif tag == "blockquote":
+            self._emit("\n\n")
+        elif tag == "a":
+            href = self._href_stack.pop() if self._href_stack else ""
+            self._emit("]({})".format(href))
+        elif tag in ("ul", "ol"):
+            if self._list_stack:
+                if self._list_stack.pop() == "ol" and self._ol_counters:
+                    self._ol_counters.pop()
+            self._emit("\n")
+        elif tag in ("td", "th"):
+            if self._cell is not None and self._row is not None:
+                # Markdown cells are single-line: flatten and escape pipes.
+                cell_text = " ".join("".join(self._cell).split())
+                self._row.append(cell_text.replace("|", "\\|"))
+                self._cell = None
+        elif tag == "tr":
+            if self._row is not None and self._rows is not None:
+                self._rows.append(self._row)
+                self._row = None
+        elif tag == "table":
+            if self._table_depth == 1 and self._rows is not None:
+                self._emit_table(self._rows)
+                self._rows = None
+            if self._table_depth:
+                self._table_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        if self._in_pre:
+            self._emit(data)
+            return
+        if data.strip() == "":
+            # Whitespace-only node between tags: keep a single separating space
+            # rather than injecting blank lines.
+            if data:
+                self._emit(" ")
+            return
+        # Collapse embedded newlines so wrapped source doesn't break paragraphs.
+        self._emit(data.replace("\r", " ").replace("\n", " "))
+
+    def unknown_decl(self, data):
+        # Capture CDATA content, e.g. Confluence code-macro bodies.
+        if self._skip_depth:
+            return
+        if data.startswith("CDATA["):
+            inner = data[6:]
+            if inner.endswith("]"):
+                inner = inner[:-1]
+            self._emit(inner)
+
+    def _emit_table(self, rows):
+        if not rows:
+            return
+        ncols = max((len(r) for r in rows), default=0)
+        if ncols == 0:
+            return
+
+        def fmt(cells):
+            padded = list(cells) + [""] * (ncols - len(cells))
+            return "| " + " | ".join(padded) + " |"
+
+        out = [fmt(rows[0]), "| " + " | ".join(["---"] * ncols) + " |"]
+        out.extend(fmt(r) for r in rows[1:])
+        self.parts.append("\n\n" + "\n".join(out) + "\n\n")
+
+    def get_markdown(self):
+        text = "".join(self.parts)
+        # Trim trailing spaces and collapse runs of blank lines to a single one.
+        lines = [ln.rstrip() for ln in text.split("\n")]
+        out = []
+        blank = 0
+        for ln in lines:
+            if ln.strip() == "":
+                blank += 1
+                if blank <= 1:
+                    out.append("")
+            else:
+                blank = 0
+                out.append(ln)
+        return "\n".join(out).strip() + "\n"
+
+
+def html_to_markdown(raw):
+    """Convert an HTML/XHTML string to Markdown, falling back to plain text."""
+    if not raw:
+        return ""
+    parser = _MarkdownExtractor()
+    try:
+        parser.feed(raw)
+        parser.close()
+        return parser.get_markdown()
+    except Exception:
+        # Never lose content: fall back to the plain-text extractor.
+        return html_to_text(raw)
+
+
+def safe_filename(name, max_len=150):
+    """
+    Turn a page title into a filesystem-safe filename component (no extension).
+
+    Strips characters that are illegal on Windows (< > : " / \\ | ? * and control
+    chars), collapses whitespace, removes trailing dots/spaces (also illegal on
+    Windows), and caps the length. Returns 'untitled' if nothing usable is left.
+    """
+    if not name:
+        return "untitled"
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name)
+    cleaned = " ".join(cleaned.split()).strip(" .")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned or "untitled"
+
+
 def cql_quote(value):
     """
     Escape a string for safe inclusion inside a double-quoted CQL literal.
@@ -153,12 +390,15 @@ class ConfluenceError(Exception):
 
 class ConfluenceClient:
     def __init__(self, base_url, token=None, user=None, password=None,
-                 verify_ssl=True, ca_cert=None, timeout=30, max_body=0):
+                 verify_ssl=True, ca_cert=None, timeout=30, max_body=0,
+                 kb_dir=None):
         if not base_url:
             raise ValueError("base_url is required")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_body = max_body
+        # Folder to mirror pages into as Markdown; None/empty disables saving.
+        self.kb_dir = kb_dir or None
 
         # Build auth header. Prefer a Personal Access Token (Bearer) if given.
         self.headers = {"Accept": "application/json"}
@@ -285,7 +525,50 @@ class ConfluenceClient:
                 version=version, url=link,
             )
         )
-        return meta + (text if text else "(this page has no readable body content)") + truncated_note
+        rendered = meta + (text if text else "(this page has no readable body content)") + truncated_note
+
+        # If a knowledge-base folder is configured, mirror the page to Markdown.
+        # This is a side effect of reading a page; it must never break the tool,
+        # so any failure is reported but swallowed.
+        if self.kb_dir:
+            try:
+                path = self._save_to_kb(title, link, space, version, storage)
+                log("saved page to knowledge base: {}".format(path))
+                rendered += "\n\n[Saved to knowledge base: {}]".format(path)
+            except OSError as e:
+                log("knowledge-base save failed: {}".format(e))
+                rendered += "\n\n[Knowledge-base save FAILED: {}]".format(e)
+        return rendered
+
+    def _save_to_kb(self, title, link, space, version, storage):
+        """
+        Write the page to '<kb_dir>/Confluence - <title>.md', overwriting any
+        existing file. Returns the path written; raises OSError on failure.
+
+        The FULL body is always saved (the CONFLUENCE_MAX_BODY limit only trims
+        what is returned to the model, not what is stored for RAG).
+        """
+        md_body = html_to_markdown(storage)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        header = (
+            "# {title}\n\n"
+            "- Source: {url}\n"
+            "- Space: {space}\n"
+            "- Version: {version}\n"
+            "- Fetched: {stamp}\n\n"
+            "---\n\n"
+        ).format(title=title, url=link or "(unknown)", space=space,
+                 version=version, stamp=stamp)
+        content = header + (md_body if md_body else "(no readable body content)\n")
+
+        # Create the folder if needed, then write. newline="\n" keeps endings
+        # consistent and avoids CRLF doubling on Windows.
+        os.makedirs(self.kb_dir, exist_ok=True)
+        filename = "Confluence - " + safe_filename(title) + ".md"
+        path = os.path.join(self.kb_dir, filename)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+        return path
 
     def get_page(self, page_id):
         if page_id is None or str(page_id).strip() == "":
@@ -742,7 +1025,13 @@ def build_arg_parser():
     p.add_argument("--max-body", type=int,
                    default=int(os.environ.get("CONFLUENCE_MAX_BODY", "0")),
                    help="Truncate page bodies to N characters, 0 = unlimited "
-                        "(env CONFLUENCE_MAX_BODY).")
+                        "(env CONFLUENCE_MAX_BODY). Applies to returned text "
+                        "only, not to saved knowledge-base files.")
+    p.add_argument("--kb-dir", default=os.environ.get("CONFLUENCE_KB_DIR"),
+                   help="If set, every page read is also saved as a Markdown "
+                        "file into this folder for a local RAG knowledge base "
+                        "(env CONFLUENCE_KB_DIR). Files are named "
+                        "'Confluence - <title>.md' and overwritten each time.")
     return p
 
 
@@ -779,6 +1068,7 @@ def main(argv=None):
             ca_cert=args.ca_cert,
             timeout=args.timeout,
             max_body=args.max_body,
+            kb_dir=args.kb_dir,
         )
     except (ValueError, ssl.SSLError, OSError) as e:
         log("FATAL: could not initialise client: {}".format(e))
@@ -786,6 +1076,8 @@ def main(argv=None):
 
     if args.insecure:
         log("WARNING: TLS verification is disabled (--insecure).")
+    if client.kb_dir:
+        log("knowledge-base mirroring enabled -> {}".format(client.kb_dir))
     log("configured for base URL {}".format(client.base_url))
 
     try:
