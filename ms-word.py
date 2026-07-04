@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-ms-word.py - A single-file MCP (Model Context Protocol) stdio server that
+msword_mcp.py - A single-file MCP (Model Context Protocol) stdio server that
 gives an AI agent read/search/edit/generate access to Word .docx files.
 
 It follows a simple open -> edit -> save workflow (msword_open ... msword_save),
@@ -12,16 +12,30 @@ WHAT IT CAN DO
     - Read full content (linear text, or a structured block list).
     - Search text (body paragraphs and table cells).
     - Replace text, correctly handling matches that span multiple runs.
+    - Record replacements/deletions as Word TRACKED CHANGES (revisions) with an
+      author and the current date, then list / accept-all / reject-all them.
     - Append paragraphs, headings and tables.
     - Apply simple paragraph formatting (bold/italic/underline/alignment/style).
     - Save in place, or save-as to a new path.
 
-WHAT IT CANNOT DO (by design - python-docx has no reliable API for these)
-    - Tracked changes / redlining.
-    - Comment threads.
-    Workaround for redlining: make the edits here, then in Word open the
-    original, Select All, and paste the edited body over it so Word records
-    the diff as tracked changes.
+TRACKED CHANGES - SCOPE AND VERIFICATION
+    Scope is text-level only: tracked insertions and deletions of text (a
+    tracked "replace" is a delete of the old text plus an insert of the new).
+    NOT supported, by design (these are the fragile OOXML cases): tracked
+    paragraph-mark changes (splitting/merging paragraphs as a revision),
+    tracked moves, and tracked formatting-only changes.
+
+    Verified before delivery: correct <w:ins>/<w:del>/<w:delText> structure with
+    unique ids + author + date; cross-run matches; accept-all and reject-all
+    round-trips; and an independent round-trip through LibreOffice, which parsed
+    and preserved the revisions. The ONE thing not verifiable off your network is
+    the exact Microsoft Word review UI - open one test file in Word on your
+    endpoint and confirm the changes appear under Review and that Accept/Reject
+    behave as expected before relying on it for anything important.
+
+WHAT IT CANNOT DO
+    - Comment threads (no reliable python-docx API).
+    - Tracked paragraph-mark / move / formatting revisions (see scope above).
 
 =============================================================================
  DEPENDENCIES  (this is the ONE place this project leaves the standard library)
@@ -58,7 +72,7 @@ WHAT IT CANNOT DO (by design - python-docx has no reliable API for these)
     Run the built-in self-test. It creates a temp .docx, opens/edits/saves/
     reopens it, and prints PASS/FAIL. No arguments, no network, no side files
     left behind:
-        "C:\path\to\python.exe" ms-word.py --check
+        "C:\path\to\python.exe" msword_mcp.py --check
 
     Expected tail of output on success:
         [check] round-trip: PASS
@@ -76,9 +90,14 @@ WHAT IT CANNOT DO (by design - python-docx has no reliable API for these)
           - name: msword-py
             command: C:\path\to\python.exe
             args:
-              - C:\path\to\ms-word.py
+              - C:\path\to\msword_mcp.py
+              - --author
+              - Matt
             env:
               PYTHONUTF8: "1"
+
+    The --author value is stamped on every tracked change. Omit the two --author
+    lines to fall back to the TRACKED_CHANGE_AUTHOR config constant below.
 
     (If your Continue build uses the older command/args-in-one style, match
     whatever your existing working Python MCP servers use - the launch shape
@@ -120,12 +139,18 @@ DOCUMENT_ROOT = None
 
 MAX_SESSIONS = 32                    # guard against runaway open() calls
 SEARCH_CONTEXT_CHARS = 40            # chars of context either side of a match
+
+# Default author name stamped on tracked changes (w:author). Override per
+# launch with:  --author "Matt"  in Continue's args: block. The date on each
+# change is always the current date, computed at edit time.
+TRACKED_CHANGE_AUTHOR = "AI Assistant (Continue)"
 # =============================================================================
 
 import sys
 import os
 import json
 import uuid
+import copy
 import argparse
 import traceback
 import datetime
@@ -159,6 +184,8 @@ try:
     from docx.text.paragraph import Paragraph
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.opc.exceptions import PackageNotFoundError
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
 except Exception as _imp_err:  # pragma: no cover - exercised only on a broken install
     sys.stderr.write(
         "[{}] FATAL: could not import python-docx.\n"
@@ -192,6 +219,13 @@ def _versions():
 # =============================================================================
 # session_id -> {"path": str, "doc": docx Document, "opened_at": iso str}
 SESSIONS = {}
+
+# Author stamped on tracked changes. Seeded from config, optionally replaced
+# by the --author launch flag in main().
+AUTHOR = TRACKED_CHANGE_AUTHOR
+
+# XML namespace literal for the reserved 'xml' prefix (qn() does not map it).
+_XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 
 class ToolError(Exception):
@@ -338,6 +372,224 @@ def _replace_in_paragraph(paragraph, find, replace, remaining):
                 run.text = left + right
         made += 1
     return made
+
+
+# -----------------------------------------------------------------------------
+# TRACKED CHANGES (revisions)
+#
+# Tracked changes are not a python-docx feature or a document flag - they are
+# specific OOXML elements inside the paragraph:
+#   insertion : the run(s) are wrapped in  <w:ins w:id w:author w:date> ... </w:ins>
+#   deletion  : the run(s) are wrapped in  <w:del ...>, and each run's <w:t>
+#               becomes <w:delText> (so the text is stored but shown struck out)
+#   a replace : is simply a deletion of the old text plus an insertion of the new.
+# We build these elements directly via lxml (OxmlElement/qn), which python-docx
+# exposes on every element. Scope is text-level only: no tracked paragraph-mark,
+# move, or formatting revisions (those are the fragile cases and are excluded).
+# -----------------------------------------------------------------------------
+def _today_iso():
+    """Current date as an OOXML xs:dateTime (time zeroed, UTC 'Z')."""
+    return datetime.date.today().strftime("%Y-%m-%dT00:00:00Z")
+
+
+def _make_rev_id_allocator(doc):
+    """
+    Return a callable yielding revision ids unique within the document. Seeds
+    above the highest existing w:ins/w:del id so we never collide with revisions
+    already in the file.
+    """
+    max_id = 0
+    ins_tag, del_tag, id_attr = qn("w:ins"), qn("w:del"), qn("w:id")
+    for el in doc.element.iter():
+        if el.tag in (ins_tag, del_tag):
+            v = el.get(id_attr)
+            if v and v.lstrip("-").isdigit():
+                max_id = max(max_id, int(v))
+    state = {"n": max_id}
+
+    def _next():
+        state["n"] += 1
+        return state["n"]
+
+    return _next
+
+
+def _normal_run_el(rpr, text):
+    """Build a plain <w:r> with the given text, copying run properties (rPr)."""
+    r = OxmlElement("w:r")
+    if rpr is not None:
+        r.append(copy.deepcopy(rpr))
+    t = OxmlElement("w:t")
+    t.set(_XML_SPACE, "preserve")  # keep leading/trailing spaces intact
+    t.text = text
+    r.append(t)
+    return r
+
+
+def _ins_el(rpr, text, rev_id, author, date):
+    """Build an <w:ins> wrapping a run that carries `text` (an insertion)."""
+    ins = OxmlElement("w:ins")
+    ins.set(qn("w:id"), str(rev_id))
+    ins.set(qn("w:author"), author)
+    ins.set(qn("w:date"), date)
+    ins.append(_normal_run_el(rpr, text))
+    return ins
+
+
+def _del_el(rpr, text, rev_id, author, date):
+    """Build a <w:del> wrapping a run whose text is stored as <w:delText>."""
+    dele = OxmlElement("w:del")
+    dele.set(qn("w:id"), str(rev_id))
+    dele.set(qn("w:author"), author)
+    dele.set(qn("w:date"), date)
+    r = OxmlElement("w:r")
+    if rpr is not None:
+        r.append(copy.deepcopy(rpr))
+    dt = OxmlElement("w:delText")
+    dt.set(_XML_SPACE, "preserve")
+    dt.text = text
+    r.append(dt)
+    dele.append(r)
+    return dele
+
+
+def _replace_element(old_el, new_els):
+    """Replace old_el in its parent with the ordered list new_els."""
+    parent = old_el.getparent()
+    idx = parent.index(old_el)
+    for j, ne in enumerate(new_els):
+        parent.insert(idx + j, ne)
+    parent.remove(old_el)
+
+
+def _tracked_replace_in_paragraph(paragraph, find, replace, remaining, author, date, next_id):
+    """
+    Tracked-changes equivalent of _replace_in_paragraph. For each match: delete
+    the matched text (wrapped in <w:del>) and, if `replace` is non-empty, insert
+    the new text (wrapped in <w:ins>) at the match position. Handles matches that
+    span multiple runs. Returns the number of matches processed.
+
+    Termination note: once matched text is wrapped in <w:del>/<w:ins> it is no
+    longer a direct child <w:r> of the paragraph, so paragraph.runs (which sees
+    only top-level runs) will not re-match it. Each pass therefore advances to
+    the next untracked occurrence, or stops.
+    """
+    made = 0
+    while True:
+        if remaining is not None and made >= remaining:
+            break
+        runs = paragraph.runs
+        if not runs:
+            break
+        texts = [r.text for r in runs]
+        full = "".join(texts)
+        idx = full.find(find)
+        if idx == -1:
+            break
+        end = idx + len(find)
+
+        starts = []
+        acc = 0
+        for t in texts:
+            starts.append(acc)
+            acc += len(t)
+
+        # Runs overlapping the match [idx, end).
+        overlapping = [
+            i for i, t in enumerate(texts)
+            if not (starts[i] + len(t) <= idx or starts[i] >= end)
+        ]
+        first = overlapping[0]
+
+        for i in overlapping:
+            r_el = runs[i]._r
+            rpr = r_el.find(qn("w:rPr"))  # deep-copied inside builders before removal
+            text = texts[i]
+            rs = starts[i]
+            re_ = rs + len(text)
+            a = max(rs, idx)
+            b = min(re_, end)
+            before = text[: a - rs]
+            inside = text[a - rs: b - rs]
+            after = text[b - rs:]
+
+            new_els = []
+            if before:
+                new_els.append(_normal_run_el(rpr, before))
+            if i == first and replace:
+                # Insertion of the new text takes the formatting of the run
+                # where the match starts (documented cross-run trade-off).
+                new_els.append(_ins_el(rpr, replace, next_id(), author, date))
+            if inside:
+                new_els.append(_del_el(rpr, inside, next_id(), author, date))
+            if after:
+                new_els.append(_normal_run_el(rpr, after))
+
+            if new_els:
+                _replace_element(r_el, new_els)
+            else:
+                r_el.getparent().remove(r_el)
+        made += 1
+    return made
+
+
+def _iter_revisions(doc):
+    """Yield (kind, element) for every top-level insertion/deletion revision."""
+    ins_tag, del_tag = qn("w:ins"), qn("w:del")
+    for el in doc.element.iter():
+        if el.tag == ins_tag:
+            yield "insertion", el
+        elif el.tag == del_tag:
+            yield "deletion", el
+
+
+def _revision_text(el):
+    """Concatenate the visible text of a revision element (w:t or w:delText)."""
+    parts = []
+    for t in el.iter(qn("w:t")):
+        parts.append(t.text or "")
+    for t in el.iter(qn("w:delText")):
+        parts.append(t.text or "")
+    return "".join(parts)
+
+
+def _accept_all(doc):
+    """Accept every tracked change: keep inserted text, drop deleted text."""
+    ins_count = del_count = 0
+    for el in list(doc.element.iter(qn("w:ins"))):
+        parent = el.getparent()
+        idx = parent.index(el)
+        for child in list(el):          # promote the inserted runs to normal
+            parent.insert(idx, child)
+            idx += 1
+        parent.remove(el)
+        ins_count += 1
+    for el in list(doc.element.iter(qn("w:del"))):
+        el.getparent().remove(el)       # deleted content disappears
+        del_count += 1
+    return ins_count, del_count
+
+
+def _reject_all(doc):
+    """Reject every tracked change: drop inserted text, restore deleted text."""
+    ins_count = del_count = 0
+    for el in list(doc.element.iter(qn("w:ins"))):
+        el.getparent().remove(el)       # inserted content disappears
+        ins_count += 1
+    for el in list(doc.element.iter(qn("w:del"))):
+        parent = el.getparent()
+        idx = parent.index(el)
+        for child in list(el):          # restore runs, delText -> t
+            for dt in child.findall(qn("w:delText")):
+                t = OxmlElement("w:t")
+                t.set(_XML_SPACE, "preserve")
+                t.text = dt.text
+                child.replace(dt, t)
+            parent.insert(idx, child)
+            idx += 1
+        parent.remove(el)
+        del_count += 1
+    return ins_count, del_count
 
 
 def _render_linear_text(doc):
@@ -529,13 +781,29 @@ def tool_replace_text(args):
         if count < 0:
             raise ToolError("'count' must be >= 0")
 
+    track = bool(args.get("track_changes", False))
+    author = args.get("author") or AUTHOR
+    date = _today_iso()
+    next_id = _make_rev_id_allocator(doc) if track else None
+
     total = 0
     for paragraph in _all_editable_paragraphs(doc):
         remaining = None if count is None else max(0, count - total)
         if remaining == 0:
             break
-        total += _replace_in_paragraph(paragraph, find, replace, remaining)
-    return {"find": find, "replace": replace, "replacements": total}
+        if track:
+            total += _tracked_replace_in_paragraph(
+                paragraph, find, replace, remaining, author, date, next_id
+            )
+        else:
+            total += _replace_in_paragraph(paragraph, find, replace, remaining)
+
+    result = {"find": find, "replace": replace, "replacements": total,
+              "tracked": track}
+    if track:
+        result["author"] = author
+        result["date"] = date
+    return result
 
 
 def tool_add_paragraph(args):
@@ -704,6 +972,33 @@ def tool_save(args):
     return {"saved": target}
 
 
+def tool_list_changes(args):
+    session = _get_session(args)
+    doc = session["doc"]
+    changes = []
+    for kind, el in _iter_revisions(doc):
+        changes.append({
+            "type": kind,
+            "id": el.get(qn("w:id")),
+            "author": el.get(qn("w:author")),
+            "date": el.get(qn("w:date")),
+            "text": _revision_text(el),
+        })
+    return {"changes": changes, "count": len(changes)}
+
+
+def tool_accept_all_changes(args):
+    session = _get_session(args)
+    ins_count, del_count = _accept_all(session["doc"])
+    return {"accepted_insertions": ins_count, "accepted_deletions": del_count}
+
+
+def tool_reject_all_changes(args):
+    session = _get_session(args)
+    ins_count, del_count = _reject_all(session["doc"])
+    return {"rejected_insertions": ins_count, "rejected_deletions": del_count}
+
+
 # =============================================================================
 # TOOL REGISTRY  (name -> (handler, JSON-Schema inputSchema, description))
 # =============================================================================
@@ -766,7 +1061,7 @@ TOOLS = [
     },
     {
         "name": "msword_replace_text",
-        "description": "Replace text across body paragraphs and table cells. Handles matches spanning multiple runs. Returns the number of replacements.",
+        "description": "Replace text across body paragraphs and table cells. Handles matches spanning multiple runs. Set track_changes=true to record each replacement as a Word tracked change (deletion of old text + insertion of new) instead of editing silently. An empty 'replace' with track_changes=true is a tracked deletion.",
         "handler": tool_replace_text,
         "inputSchema": {
             "type": "object",
@@ -775,6 +1070,8 @@ TOOLS = [
                 "find": {"type": "string"},
                 "replace": {"type": "string", "default": ""},
                 "count": {"type": "integer", "description": "Optional max total replacements; omit to replace all."},
+                "track_changes": {"type": "boolean", "default": False, "description": "Record edits as Word tracked changes."},
+                "author": {"type": "string", "description": "Override the tracked-change author for this call (defaults to the server's --author)."},
             },
             "required": ["session_id", "find"],
         },
@@ -871,6 +1168,36 @@ TOOLS = [
             "required": ["session_id"],
         },
     },
+    {
+        "name": "msword_list_changes",
+        "description": "List all tracked changes (insertions and deletions) currently in the document, with author, date and text.",
+        "handler": tool_list_changes,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string"}},
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "msword_accept_all_changes",
+        "description": "Accept every tracked change: inserted text is kept as normal text and deleted text is removed.",
+        "handler": tool_accept_all_changes,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string"}},
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "msword_reject_all_changes",
+        "description": "Reject every tracked change: inserted text is removed and deleted text is restored.",
+        "handler": tool_reject_all_changes,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string"}},
+            "required": ["session_id"],
+        },
+    },
 ]
 
 _TOOL_BY_NAME = {t["name"]: t for t in TOOLS}
@@ -958,6 +1285,7 @@ def serve():
     log("starting")
     log("interpreter: {}".format(sys.executable))
     log("python-docx {} / lxml {}".format(docx_ver, lxml_ver))
+    log("tracked-change author: {}".format(AUTHOR))
     if DOCUMENT_ROOT:
         log("path sandbox DOCUMENT_ROOT = {}".format(DOCUMENT_ROOT))
 
@@ -1044,6 +1372,46 @@ def run_check():
         tool_close({"session_id": reopened["session_id"]})
 
         print("[check] round-trip: PASS")
+
+        # --- Tracked-changes round-trip -------------------------------------
+        tpath = os.path.join(tmpdir, "tracked.docx")
+        td = docx.Document()
+        td.add_paragraph("The report is DRAFT and confidential.")
+        td.save(tpath)
+
+        ts = tool_open({"path": tpath})
+        tsid = ts["session_id"]
+        rt = tool_replace_text({"session_id": tsid, "find": "DRAFT",
+                                "replace": "FINAL", "track_changes": True,
+                                "author": "Self Test"})
+        assert rt["replacements"] == 1 and rt["tracked"], "tracked replace failed"
+
+        listed = tool_list_changes({"session_id": tsid})
+        kinds = sorted(c["type"] for c in listed["changes"])
+        assert kinds == ["deletion", "insertion"], \
+            "expected one insertion + one deletion, got {}".format(kinds)
+        assert all(c["author"] == "Self Test" for c in listed["changes"]), \
+            "author not stamped"
+
+        tpath2 = os.path.join(tmpdir, "tracked2.docx")
+        tool_save({"session_id": tsid, "path": tpath2})
+        tool_close({"session_id": tsid})
+
+        # Accept path: FINAL stays, DRAFT gone.
+        a = tool_open({"path": tpath2})
+        tool_accept_all_changes({"session_id": a["session_id"]})
+        atext = tool_get_content({"session_id": a["session_id"], "mode": "text"})["content"]
+        assert "FINAL" in atext and "DRAFT" not in atext, "accept-all wrong"
+        tool_close({"session_id": a["session_id"]})
+
+        # Reject path: DRAFT restored, FINAL gone.
+        r = tool_open({"path": tpath2})
+        tool_reject_all_changes({"session_id": r["session_id"]})
+        rtext = tool_get_content({"session_id": r["session_id"], "mode": "text"})["content"]
+        assert "DRAFT" in rtext and "FINAL" not in rtext, "reject-all wrong"
+        tool_close({"session_id": r["session_id"]})
+
+        print("[check] tracked-changes: PASS")
     except Exception as e:
         ok = False
         print("[check] round-trip: FAIL -> {}".format(e))
@@ -1073,7 +1441,16 @@ def main():
         "--check", action="store_true",
         help="Run an offline open/edit/save/reopen self-test and exit."
     )
+    parser.add_argument(
+        "--author", default=None, metavar="NAME",
+        help="Author name stamped on tracked changes "
+             "(default: the TRACKED_CHANGE_AUTHOR config value)."
+    )
     args = parser.parse_args()
+
+    global AUTHOR
+    if args.author:
+        AUTHOR = args.author
 
     if args.check:
         sys.exit(run_check())
