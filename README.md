@@ -158,6 +158,7 @@ mcpServers:
 | CLI flag | Purpose |
 |---|---|
 | `--check` | Run an offline open/edit/save/reopen self-test and exit (no server) |
+| `--author` | Author name stamped on Word tracked changes (default: the `TRACKED_CHANGE_AUTHOR` config value in the file). Can also be overridden per-call via the `author` argument on `msword_replace_text` |
 
 ```yaml
 mcpServers:
@@ -165,6 +166,8 @@ mcpServers:
     command: C:\path\to\python.exe
     args:
       - C:\path\to\ms-word.py
+      - --author
+      - Matt
     env:
       PYTHONUTF8: "1"
 ```
@@ -239,6 +242,10 @@ one or more of the tools the server exposes.
 3. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
 4. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
 5. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
+6. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
+7. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
+8. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
+9. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
 
 ### pdf-to-md.py
 
