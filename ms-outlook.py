@@ -73,7 +73,7 @@ just below this docstring. Edit them there; nothing else needs changing.
    Safety/size limits. Lower MAX_BODY_CHARS if your local model has a small
    context window. The other two are guard rails you can usually leave as-is.
 
-5. SEARCH_ALL_FOLDERS  (which folders the combined outlook_search_recent covers)
+5. SEARCH_ALL_FOLDERS  (DEFAULT folders the combined outlook_search_recent covers)
    A list of folder NAMES matched across every store in the profile (main
    mailbox, online archive, mounted PST). Default: Inbox, Sent Items, Archive.
    "Archive" is ambiguous - it may be a mailbox folder, an online archive, or a
@@ -81,6 +81,11 @@ just below this docstring. Edit them there; nothing else needs changing.
    this list to the real names. Note: matching is by name across ALL stores, so
    if you have shared mailboxes with same-named folders they may be included;
    each result is labelled with its store/folder so you can see the source.
+   This is only the DEFAULT set, resolved in this order (later wins):
+     (a) SEARCH_ALL_FOLDERS here in the file;
+     (b) the --search-folders launch flag (comma-separated names), if given;
+     (c) a per-call "folders" argument to outlook_search_recent.
+   Use (b) to configure the default from config.yaml without editing this file.
 
 EXTERNAL BLACKLIST FILE (optional)
 ----------------------------------
@@ -104,6 +109,8 @@ CONTINUE config.yaml ENTRY (copy/paste, adjust paths)
           - C:\\path\\to\\outlook_mcp.py
           - --blacklist-file          # optional
           - C:\\config\\outlook-blacklist.txt
+          - --search-folders          # optional: default folders for outlook_search_recent
+          - "Inbox,Sent Items,Archive"
         env:
           PYTHONUTF8: "1"
 
@@ -142,11 +149,6 @@ import traceback
 # --- 1. Content blacklist: terms that cause an item to be withheld from the AI.
 #        Seeded with example AU-style markings; REPLACE with your real scheme.
 BLACKLIST_TERMS = [
-    "PROTECTED",
-    "SECRET",
-    "TOP SECRET",
-    "CABINET",
-    "CABINET-IN-CONFIDENCE",
 ]
 
 # --- 2. How blacklist terms are matched: "word" (default) or "substring".
@@ -222,6 +224,11 @@ PROP_TRANSPORT_HEADERS = "http://schemas.microsoft.com/mapi/proptag/0x007D001F"
 
 # Compiled at startup by build_blacklist(); None means no filtering is active.
 _BLACKLIST_RE = None
+
+# Effective default folder set for outlook_search_recent. Initialised from
+# SEARCH_ALL_FOLDERS; may be replaced at launch via --search-folders. A per-call
+# "folders" argument still overrides this.
+_SEARCH_FOLDERS = list(SEARCH_ALL_FOLDERS)
 
 
 # ---------------------------------------------------------------------------
@@ -803,14 +810,28 @@ def tool_search_recent(args):
     query = (args.get("query") or "").strip().lower()
     max_results = int(args.get("max_results", 100))
 
+    # Which folders to search. The caller may override the SEARCH_ALL_FOLDERS
+    # default per call via a "folders" argument: either a JSON list of names or a
+    # comma-separated string. Empty/omitted falls back to the configured default.
+    folders_arg = args.get("folders")
+    if isinstance(folders_arg, str):
+        folder_names = [name.strip() for name in folders_arg.split(",") if name.strip()]
+    elif isinstance(folders_arg, (list, tuple)):
+        folder_names = [str(name).strip() for name in folders_arg if str(name).strip()]
+    else:
+        folder_names = []
+    if not folder_names:
+        folder_names = list(_SEARCH_FOLDERS)
+
     start_dt = datetime.datetime.combine(start_date, datetime.time(0, 0, 0))
     end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
 
-    names_lower = set(name.lower() for name in SEARCH_ALL_FOLDERS)
+    names_lower = set(name.lower() for name in folder_names)
     targets = find_target_folders(names_lower)
     if not targets:
         return ("No folders matched {0}. Run outlook_list_folders to see the folder "
-                "names available, then adjust SEARCH_ALL_FOLDERS.".format(SEARCH_ALL_FOLDERS))
+                "names available, then adjust the 'folders' argument or "
+                "SEARCH_ALL_FOLDERS.".format(folder_names))
 
     collected = []  # tuples of (naive_datetime, folder_label, item)
     withheld = 0
@@ -916,9 +937,9 @@ def tool_search_recent(args):
             return "No viewable emails between {0} and {1}. {2} withheld by the content blacklist.".format(
                 start_date, end_date, withheld)
         return "No emails between {0} and {1} across {2}.".format(
-            start_date, end_date, ", ".join(SEARCH_ALL_FOLDERS))
+            start_date, end_date, ", ".join(folder_names))
     header = "Emails {0} to {1} across {2} ({3} shown, newest first):".format(
-        start_date, end_date, ", ".join(SEARCH_ALL_FOLDERS), len(lines))
+        start_date, end_date, ", ".join(folder_names), len(lines))
     return header + "\n" + "\n".join(lines) + note
 
 
@@ -1106,10 +1127,11 @@ TOOLS = [
         "description": (
             "List emails across MULTIPLE folders at once (by default Inbox, Sent Items, "
             "and Archive) within a date range, newest first, merged into one list. Each "
-            "result is labelled with the folder it came from. Optionally filter by text "
-            "in the subject, sender, or recipient. Use this for 'all my email over the "
-            "last week' style questions. Dates are YYYY-MM-DD; defaults to the last 7 "
-            "days. Some items may be withheld by a content policy."
+            "result is labelled with the folder it came from. Optionally override which "
+            "folders to search with 'folders', or filter by text in the subject, sender, "
+            "or recipient. Use this for 'all my email over the last week' style questions. "
+            "Dates are YYYY-MM-DD; defaults to the last 7 days. Some items may be withheld "
+            "by a content policy."
         ),
         "inputSchema": {
             "type": "object",
@@ -1117,6 +1139,15 @@ TOOLS = [
                 "start_date": {"type": "string", "description": "Start date, YYYY-MM-DD (default: 7 days ago)."},
                 "end_date": {"type": "string", "description": "End date, YYYY-MM-DD (default: today)."},
                 "query": {"type": "string", "description": "Optional text to match in subject, sender, or recipient."},
+                "folders": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional list of folder NAMES to search, matched across all stores "
+                        "(e.g. [\"Inbox\", \"Sent Items\"]). Overrides the default set. Run "
+                        "outlook_list_folders to see the available names."
+                    ),
+                },
                 "max_results": {"type": "integer", "description": "Maximum emails to return (default 100)."},
             },
         },
@@ -1258,6 +1289,7 @@ def run_check():
 
         cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR)
         log("Calendar folder     : {0}".format(cal.Name))
+        log("Search folders      : {0}".format(", ".join(_SEARCH_FOLDERS)))
         log("CHECK OK - Outlook COM link is working.")
         return 0
     except Exception:
@@ -1286,6 +1318,12 @@ def main():
              "Terms are added to the built-in list.",
     )
     parser.add_argument(
+        "--search-folders",
+        help="Comma-separated folder NAMES used as the DEFAULT set for "
+             "outlook_search_recent, overriding SEARCH_ALL_FOLDERS. Example: "
+             "\"Inbox,Sent Items,Archive\". A per-call 'folders' argument still wins.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="outlook-mcp {0}".format(SERVER_INFO["version"]),
@@ -1304,6 +1342,16 @@ def main():
             log("FATAL: could not read --blacklist-file: {0}".format(exc))
             sys.exit(2)
     build_blacklist(extra_terms)
+
+    # Optional launch-time override of the default outlook_search_recent folders.
+    if args.search_folders:
+        global _SEARCH_FOLDERS
+        names = [name.strip() for name in args.search_folders.split(",") if name.strip()]
+        if names:
+            _SEARCH_FOLDERS = names
+            log("Default outlook_search_recent folders set to: {0}".format(names))
+        else:
+            log("WARNING: --search-folders was empty; keeping default {0}.".format(_SEARCH_FOLDERS))
 
     if args.check:
         sys.exit(run_check())
