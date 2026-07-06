@@ -11,7 +11,8 @@ launch the server with.
 | Server | pip install | Notes |
 |---|---|---|
 | `confluence.py` | _none_ | standard library only |
-| `knowledge-base.py` | _none_ | standard library only |
+| `knowledge-base.py` | _none_ | standard library only (keyword search) |
+| `knowledge-base-semantic.py` | _none_ | standard library only; meaning-based retrieval driven by your connected model (no local embedding model, no network) |
 | `ms-excel.py` | _none_ | standard library only (parses .xlsx as a zip of XML) |
 | `ms-word.py` | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
 | `ms-outlook.py` | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
@@ -97,6 +98,55 @@ mcpServers:
       - C:\path\to\knowledge-base.py
       - --docs-dir
       - C:\reference-docs
+    env:
+      PYTHONUTF8: "1"
+```
+
+> For meaning-based (rather than keyword) retrieval over the same kind of
+> folder, see `knowledge-base-semantic.py` below. You can run both at once
+> (different `name:` and folder).
+
+### knowledge-base-semantic.py
+
+Meaning-based retrieval over a folder of your own markdown files (notes,
+policies, reference docs). Ask a question in your own words — e.g. *"can I
+extend my work trip by two days, pay my own weekend accommodation, and fly
+back Monday?"* — and the agent finds the relevant part of your travel policy
+and reasons over it, without you naming the file.
+
+**How it stays "semantic" with no embedding model and no network:** MCP has no
+way for a server to ask the client for embeddings, and Continue does not
+support MCP *sampling* (server-initiated LLM calls), so the server cannot call
+your model itself. Instead it hands the agent — which *is* the model you
+connect to — a compact, structure-aware **map** of the knowledge base
+(`kb_outline`: every document + its section headings + a one-line lead). The
+agent picks the right document/section by *meaning*, then reads exactly that
+section (`kb_read`). Retrieval by meaning, using the model you already talk to,
+with zero dependencies. (If you ever want true vector embeddings, that requires
+either a local embedding model or a remote embeddings API — neither of which
+this offline-friendly server uses.)
+
+| Tool | Purpose |
+|---|---|
+| `kb_list` | List every document with its title (inventory) |
+| `kb_outline` | The map: every document's heading tree + a lead line per section — call this first for a topic question, then pick by meaning |
+| `kb_search` | Keyword search across all docs; reports the matching section heading and a snippet (fast lookup / narrowing a large KB) |
+| `kb_read` | Read one document in full, or just one named `section` of it (loose name/heading matching) |
+
+| CLI flag | Purpose |
+|---|---|
+| `--docs-dir` | Folder of markdown/text docs to expose (`.md`/`.markdown`/`.txt`), searched recursively. Falls back to the `KB_DOCS_DIR` env var |
+| `--check` | List the folder's documents (and a heading count each) to stderr, then exit (no server) |
+| `--version` | Print version and exit |
+
+```yaml
+mcpServers:
+  - name: kb
+    command: C:\path\to\python.exe
+    args:
+      - C:\path\to\knowledge-base-semantic.py
+      - --docs-dir
+      - C:\Users\me\knowledge-base
     env:
       PYTHONUTF8: "1"
 ```
@@ -222,6 +272,15 @@ one or more of the tools the server exposes.
 2. "Find any reference material about our procurement policy." → `reference_search`
 3. "Read the full expense-reporting policy document and tell me the approval limits." → `reference_get`
 4. "Search our reference docs for anything about onboarding, then read whichever one covers IT equipment." → `reference_search` followed by `reference_get`
+
+### knowledge-base-semantic.py
+
+1. "Using my knowledge base, can I extend my work trip by 2 days, pay for my own accommodation for the weekend, and fly back Monday?" → `kb_outline` to map the docs, then `kb_read` (with a `section`) on the travel policy's trip-extension section, and reason over it
+2. "What's in my knowledge base?" → `kb_list`
+3. "Give me a map of everything in my knowledge base so I can see what topics are covered." → `kb_outline`
+4. "Find anything mentioning 'accommodation' or 'per diem'." → `kb_search`
+5. "Read just the 'Expense Claims' section of the travel policy." → `kb_read` with `section`
+6. "Open the whole onboarding checklist document." → `kb_read` (no `section`)
 
 ### ms-excel.py
 
