@@ -129,6 +129,7 @@ running, and logged into a profile.
 | CLI flag | Purpose |
 |---|---|
 | `--blacklist-file` | Path to a file of extra content-blacklist terms (one per line, `#` for comments), added to the built-in list |
+| `--search-folders` | Comma-separated folder names used as the **default** folder set for `outlook_search_recent`, overriding the `SEARCH_ALL_FOLDERS` value in the file (e.g. `"Inbox,Sent Items,Archive"`). A per-call `folders` argument still takes priority |
 | `--check` | Connect to Outlook, print diagnostics + blacklist status to stderr, then exit (no server) |
 | `--version` | Print version and exit |
 
@@ -142,7 +143,7 @@ for these):
 | `BLACKLIST_MATCH_MODE` | `"word"` (default, whole-term match) or `"substring"` (for terms containing punctuation) |
 | `RESTRICT_DATE_FORMAT` | Locale-sensitive date format Outlook expects in its `Restrict()` filter — switch this if `outlook_get_calendar` returns zero events on a non-US-locale machine |
 | `MAX_BODY_CHARS` / `CALENDAR_HARD_CAP` / `SEARCH_SCAN_CAP` | Safety caps on body length / items scanned |
-| `SEARCH_ALL_FOLDERS` | Folder names (matched across every store) that `outlook_search_recent` searches — default `["Inbox", "Sent Items", "Archive"]`; use `outlook_list_folders` to see real folder names first |
+| `SEARCH_ALL_FOLDERS` | Folder names (matched across every store) that `outlook_search_recent` searches by default — `["Inbox", "Sent Items", "Archive"]`; use `outlook_list_folders` to see real folder names first. This is only the built-in default: override it at launch with `--search-folders`, or per call by passing a `folders` argument to `outlook_search_recent` |
 
 ```yaml
 mcpServers:
@@ -152,6 +153,8 @@ mcpServers:
       - C:\path\to\ms-outlook.py
       - --blacklist-file
       - C:\config\outlook-blacklist.txt
+      - --search-folders
+      - "Inbox,Sent Items,Archive"
     env:
       PYTHONUTF8: "1"
 ```
@@ -237,7 +240,8 @@ one or more of the tools the server exposes.
 4. "What's on my calendar for the next 7 days?" → `outlook_get_calendar`
 5. "What did I send last week?" → `outlook_list_sent_emails`
 6. "Find everything about the 'Acme renewal' across my Inbox, Sent Items and Archive from the last month." → `outlook_search_recent`
-7. "What are my actual Outlook folder names, so I can point the search at the right archive?" → `outlook_list_folders`
+7. "Search only my 'Projects' and 'Sent Items' folders for anything about the budget review." → `outlook_search_recent` with a `folders` argument overriding the default set
+8. "What are my actual Outlook folder names, so I can point the search at the right archive?" → `outlook_list_folders`
 
 ### ms-word.py
 
