@@ -214,7 +214,16 @@ mcpServers:
 | CLI flag | Purpose |
 |---|---|
 | `--check` | Run an offline open/edit/save/reopen self-test and exit (no server) |
-| `--author` | Author name stamped on Word tracked changes (default: the `TRACKED_CHANGE_AUTHOR` config value in the file). Can also be overridden per-call via the `author` argument on `msword_replace_text` |
+| `--author` | Author name stamped on Word tracked changes (default: the `TRACKED_CHANGE_AUTHOR` config value in the file). Can also be overridden per-call via the `author` argument on the editing tools (`msword_replace_text`, `msword_set_paragraph_text`, `msword_insert_paragraph`, `msword_delete_paragraph`) |
+
+Tracked changes are recorded the way Word itself records them: replacements
+are diffed **word-by-word** (only the words that actually change are marked
+as deleted/inserted — never "whole paragraph deleted + whole paragraph
+reinserted"), and whole-paragraph inserts/deletes include the paragraph mark
+so accepting/rejecting adds or removes the paragraph itself. Changes can be
+accepted/rejected all at once or individually by id. While changes are
+pending, `msword_get_content`/`msword_search` show the final ("No Markup")
+view.
 
 ```yaml
 mcpServers:
@@ -310,9 +319,14 @@ one or more of the tools the server exposes.
 4. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
 5. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
 6. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
-7. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
-8. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
-9. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
+7. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
+8. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
+9. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
+10. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
+11. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
+12. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
+13. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
+14. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
 
 ### pdf-to-md.py
 

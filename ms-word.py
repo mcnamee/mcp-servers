@@ -12,30 +12,60 @@ WHAT IT CAN DO
     - Read full content (linear text, or a structured block list).
     - Search text (body paragraphs and table cells).
     - Replace text, correctly handling matches that span multiple runs.
-    - Record replacements/deletions as Word TRACKED CHANGES (revisions) with an
-      author and the current date, then list / accept-all / reject-all them.
-    - Append paragraphs, headings and tables.
+    - Record edits as Word TRACKED CHANGES (revisions) with author + date,
+      the way Word itself records them:
+        * replacements are DIFFED WORD-BY-WORD, so only the words that
+          actually change are marked (never "whole paragraph deleted +
+          whole paragraph inserted"); unchanged words keep their original
+          runs and formatting
+        * whole-paragraph insert/delete including the PARAGRAPH MARK, so
+          accepting/rejecting adds or removes the paragraph itself
+        * rewrite a whole paragraph (set_paragraph_text) as a tracked
+          word-level diff of old vs new
+    - List tracked changes (with location + context), then accept or reject
+      them - all at once, or individually by change id.
+    - Read/search the FINAL view while changes are pending (like Word's
+      "No Markup"): pending insertions are visible, pending deletions hidden.
+    - Append paragraphs, headings and tables; insert paragraphs anywhere.
     - Apply simple paragraph formatting (bold/italic/underline/alignment/style).
     - Save in place, or save-as to a new path.
 
 TRACKED CHANGES - SCOPE AND VERIFICATION
-    Scope is text-level only: tracked insertions and deletions of text (a
-    tracked "replace" is a delete of the old text plus an insert of the new).
-    NOT supported, by design (these are the fragile OOXML cases): tracked
-    paragraph-mark changes (splitting/merging paragraphs as a revision),
-    tracked moves, and tracked formatting-only changes.
+    Supported (mirrors what Word records for normal typing with Track
+    Changes on):
+      - text insertions/deletions: <w:ins> / <w:del> + <w:delText>, produced
+        from a word-level diff of old vs new text (difflib.SequenceMatcher
+        over word/whitespace tokens);
+      - paragraph insertion/deletion including the paragraph mark
+        (an empty <w:ins>/<w:del> inside w:pPr/w:rPr), so a deleted
+        paragraph disappears entirely on accept and an inserted paragraph
+        disappears entirely on reject, with Word's paragraph-merge
+        semantics (the following paragraph's mark survives a merge);
+      - accept/reject of every change, or of individual changes by w:id.
+    NOT supported, by design (fragile/rare OOXML cases): tracked moves
+    (w:moveFrom/w:moveTo - a move appears as delete + insert instead),
+    tracked formatting-only changes (w:rPrChange/w:pPrChange), tracked
+    table row/cell revisions, and comment threads.
 
-    Verified before delivery: correct <w:ins>/<w:del>/<w:delText> structure with
-    unique ids + author + date; cross-run matches; accept-all and reject-all
-    round-trips; and an independent round-trip through LibreOffice, which parsed
-    and preserved the revisions. The ONE thing not verifiable off your network is
-    the exact Microsoft Word review UI - open one test file in Word on your
-    endpoint and confirm the changes appear under Review and that Accept/Reject
-    behave as expected before relying on it for anything important.
+    Verified before delivery: correct <w:ins>/<w:del>/<w:delText> and
+    paragraph-mark structure with unique ids + author + date; word-level
+    diff granularity; cross-run matches with formatting preserved on
+    unchanged words; accept-all / reject-all / accept-by-id round-trips
+    (all exercised by --check); and an independent round-trip through
+    LibreOffice Writer, which parsed and preserved the revisions and their
+    authors. (One known LibreOffice-only quirk: if the SAME paragraph mark
+    carries both an insertion and a deletion - e.g. a tracked-inserted
+    paragraph later tracked-deleted - LO's re-export keeps only one of the
+    two markers. The files this server writes are correct; only re-saving
+    them from LO loses that corner case.) The ONE thing not verifiable off
+    your network is the exact Microsoft Word review UI - open one test file
+    in Word on your endpoint and confirm the changes appear under Review
+    and that Accept/Reject behave as expected before relying on it for
+    anything important.
 
 WHAT IT CANNOT DO
     - Comment threads (no reliable python-docx API).
-    - Tracked paragraph-mark / move / formatting revisions (see scope above).
+    - Tracked move / formatting-only / table-row revisions (see scope above).
 
 =============================================================================
  DEPENDENCIES  (this is the ONE place this project leaves the standard library)
@@ -128,7 +158,7 @@ failed transfer" rule):
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
 # =============================================================================
 SERVER_NAME = "msword-py"          # advertised to the MCP client
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 
 # Optional path sandbox. If set to a directory string, the server will refuse
@@ -148,9 +178,11 @@ TRACKED_CHANGE_AUTHOR = "AI Assistant (Continue)"
 
 import sys
 import os
+import re
 import json
 import uuid
 import copy
+import difflib
 import argparse
 import traceback
 import datetime
@@ -379,17 +411,71 @@ def _replace_in_paragraph(paragraph, find, replace, remaining):
 #
 # Tracked changes are not a python-docx feature or a document flag - they are
 # specific OOXML elements inside the paragraph:
-#   insertion : the run(s) are wrapped in  <w:ins w:id w:author w:date> ... </w:ins>
-#   deletion  : the run(s) are wrapped in  <w:del ...>, and each run's <w:t>
-#               becomes <w:delText> (so the text is stored but shown struck out)
-#   a replace : is simply a deletion of the old text plus an insertion of the new.
+#   text insertion : run(s) wrapped in  <w:ins w:id w:author w:date> ... </w:ins>
+#   text deletion  : run(s) wrapped in  <w:del ...>, and each run's <w:t>
+#                    becomes <w:delText> (text is stored but shown struck out)
+#   paragraph mark : an empty <w:ins>/<w:del> inside w:pPr/w:rPr marks the
+#                    pilcrow itself as inserted/deleted - this is how Word
+#                    records whole-paragraph insertion/deletion, and it is what
+#                    makes accept/reject add or remove the paragraph itself.
+#
+# To match how Word records an edit, a "replace" is NOT one big delete plus one
+# big insert: the old and new text are diffed word-by-word and only the words
+# that actually change are wrapped. Unchanged words keep their original runs
+# (and therefore their formatting) untouched.
+#
 # We build these elements directly via lxml (OxmlElement/qn), which python-docx
-# exposes on every element. Scope is text-level only: no tracked paragraph-mark,
-# move, or formatting revisions (those are the fragile cases and are excluded).
+# exposes on every element. Excluded by design: tracked moves, formatting-only
+# revisions and table-row revisions (the fragile OOXML cases).
 # -----------------------------------------------------------------------------
 def _today_iso():
     """Current date as an OOXML xs:dateTime (time zeroed, UTC 'Z')."""
     return datetime.date.today().strftime("%Y-%m-%dT00:00:00Z")
+
+
+# Tokeniser for the word-level diff: alternating words / whitespace stretches.
+_TOKEN_RE = re.compile(r"\s+|\S+")
+
+
+def _word_diff(old, new):
+    """
+    Word-level diff between two strings, expressed as edits to `old`.
+
+    Returns (del_spans, insertions):
+      del_spans  - sorted list of (start, end) char offsets into `old` that
+                   must be recorded as tracked deletions
+      insertions - dict {char_offset_into_old: text} of tracked insertions,
+                   each anchored immediately BEFORE the character at that
+                   offset (offset == len(old) means "append at the end").
+                   Replacement text is anchored at the END of its deleted
+                   span so the markup reads: old text struck out, then new.
+    """
+    a = _TOKEN_RE.findall(old)
+    b = _TOKEN_RE.findall(new)
+    # autojunk=False: whitespace tokens are "popular" and would otherwise be
+    # junked, which stops the words around them from lining up as equal.
+    matcher = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    # a_off[i] = char offset of token i within `old`.
+    a_off = [0]
+    for tok in a:
+        a_off.append(a_off[-1] + len(tok))
+
+    del_spans = []
+    insertions = {}
+
+    def _insert_at(pos, text):
+        insertions[pos] = insertions.get(pos, "") + text
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "delete":
+            del_spans.append((a_off[i1], a_off[i2]))
+        elif tag == "insert":
+            _insert_at(a_off[i1], "".join(b[j1:j2]))
+        elif tag == "replace":
+            del_spans.append((a_off[i1], a_off[i2]))
+            _insert_at(a_off[i2], "".join(b[j1:j2]))
+        # 'equal' spans need nothing: their runs stay untouched.
+    return del_spans, insertions
 
 
 def _make_rev_id_allocator(doc):
@@ -414,24 +500,47 @@ def _make_rev_id_allocator(doc):
     return _next
 
 
+def _append_run_text(r, text, deleted=False):
+    """
+    Append text content to a run element, encoding tabs and newlines as the
+    proper <w:tab/>/<w:br/> elements (a literal \\t or \\n inside <w:t> is NOT
+    a tab/break to Word). Deleted text is stored as <w:delText> per the schema.
+    """
+    t_tag = "w:delText" if deleted else "w:t"
+    for part in re.split("([\\t\\n])", text):
+        if part == "":
+            continue
+        if part == "\t":
+            r.append(OxmlElement("w:tab"))
+        elif part == "\n":
+            r.append(OxmlElement("w:br"))
+        else:
+            t = OxmlElement(t_tag)
+            t.set(_XML_SPACE, "preserve")  # keep leading/trailing spaces intact
+            t.text = part
+            r.append(t)
+
+
+def _set_rev_attrs(el, rev_id, author, date):
+    """Stamp the mandatory revision attributes onto a w:ins/w:del element."""
+    el.set(qn("w:id"), str(rev_id))
+    el.set(qn("w:author"), author)
+    el.set(qn("w:date"), date)
+
+
 def _normal_run_el(rpr, text):
     """Build a plain <w:r> with the given text, copying run properties (rPr)."""
     r = OxmlElement("w:r")
     if rpr is not None:
         r.append(copy.deepcopy(rpr))
-    t = OxmlElement("w:t")
-    t.set(_XML_SPACE, "preserve")  # keep leading/trailing spaces intact
-    t.text = text
-    r.append(t)
+    _append_run_text(r, text)
     return r
 
 
 def _ins_el(rpr, text, rev_id, author, date):
     """Build an <w:ins> wrapping a run that carries `text` (an insertion)."""
     ins = OxmlElement("w:ins")
-    ins.set(qn("w:id"), str(rev_id))
-    ins.set(qn("w:author"), author)
-    ins.set(qn("w:date"), date)
+    _set_rev_attrs(ins, rev_id, author, date)
     ins.append(_normal_run_el(rpr, text))
     return ins
 
@@ -439,18 +548,95 @@ def _ins_el(rpr, text, rev_id, author, date):
 def _del_el(rpr, text, rev_id, author, date):
     """Build a <w:del> wrapping a run whose text is stored as <w:delText>."""
     dele = OxmlElement("w:del")
-    dele.set(qn("w:id"), str(rev_id))
-    dele.set(qn("w:author"), author)
-    dele.set(qn("w:date"), date)
+    _set_rev_attrs(dele, rev_id, author, date)
     r = OxmlElement("w:r")
     if rpr is not None:
         r.append(copy.deepcopy(rpr))
-    dt = OxmlElement("w:delText")
-    dt.set(_XML_SPACE, "preserve")
-    dt.text = text
-    r.append(dt)
+    _append_run_text(r, text, deleted=True)
     dele.append(r)
     return dele
+
+
+def _wrap_run_in_ins(r_el, rev_id, author, date):
+    """Wrap an existing run element in <w:ins>, in place."""
+    ins = OxmlElement("w:ins")
+    _set_rev_attrs(ins, rev_id, author, date)
+    r_el.addprevious(ins)
+    ins.append(r_el)
+
+
+def _wrap_run_in_del(r_el, rev_id, author, date):
+    """Wrap an existing run element in <w:del> and convert w:t -> w:delText."""
+    dele = OxmlElement("w:del")
+    _set_rev_attrs(dele, rev_id, author, date)
+    r_el.addprevious(dele)
+    dele.append(r_el)
+    for t in list(r_el.iter(qn("w:t"))):
+        dt = OxmlElement("w:delText")
+        space = t.get(_XML_SPACE)
+        if space:
+            dt.set(_XML_SPACE, space)
+        dt.text = t.text
+        t.getparent().replace(t, dt)
+
+
+def _para_mark_rpr(p_el):
+    """Get or create the paragraph-mark run properties element (w:pPr/w:rPr)."""
+    pPr = p_el.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = OxmlElement("w:pPr")
+        p_el.insert(0, pPr)  # pPr must be the first child of w:p
+    rPr = pPr.find(qn("w:rPr"))
+    if rPr is None:
+        rPr = OxmlElement("w:rPr")
+        # Schema order inside pPr: rPr comes after every other property,
+        # before only sectPr and pPrChange.
+        anchor = pPr.find(qn("w:sectPr"))
+        if anchor is None:
+            anchor = pPr.find(qn("w:pPrChange"))
+        if anchor is not None:
+            anchor.addprevious(rPr)
+        else:
+            pPr.append(rPr)
+    return rPr
+
+
+def _mark_paragraph_mark(p_el, kind, rev_id, author, date):
+    """
+    Mark the paragraph mark (the pilcrow) as a tracked insertion or deletion:
+    an empty <w:ins>/<w:del> inside w:pPr/w:rPr. This is how Word records a
+    whole-paragraph insert/delete, and it is what makes accept/reject remove
+    or restore the paragraph itself rather than just its text.
+    `kind` is "w:ins" or "w:del".
+    """
+    marker = OxmlElement(kind)
+    _set_rev_attrs(marker, rev_id, author, date)
+    _para_mark_rpr(p_el).insert(0, marker)  # ins/del come first in CT_ParaRPr
+    return marker
+
+
+def _mark_para_boundary(p_el, kind, rev_id, author, date):
+    """
+    Record the paragraph break belonging to p_el as inserted/deleted, the way
+    Word does it. Normally that is p_el's own paragraph mark; but a document's
+    FINAL paragraph mark can never be inserted or deleted (Word treats it as
+    permanent), so when no paragraph follows, the break that actually
+    appears/disappears is the one BEFORE p_el - mark the previous paragraph's
+    pilcrow instead. Returns the element whose mark was tagged.
+    """
+    p_tag = qn("w:p")
+    nxt = p_el.getnext()
+    if nxt is not None and nxt.tag == p_tag:
+        _mark_paragraph_mark(p_el, kind, rev_id, author, date)
+        return p_el
+    prev = p_el.getprevious()
+    if prev is not None and prev.tag == p_tag:
+        _mark_paragraph_mark(prev, kind, rev_id, author, date)
+        return prev
+    # Only paragraph in its parent: no break to mark. Word behaves the same -
+    # deleting everything in a one-paragraph document leaves an empty
+    # paragraph; the text-level revision alone captures the change.
+    return None
 
 
 def _replace_element(old_el, new_els):
@@ -462,85 +648,126 @@ def _replace_element(old_el, new_els):
     parent.remove(old_el)
 
 
+def _apply_tracked_edit(paragraph, del_spans, insertions, author, date, next_id):
+    """
+    Rewrite a paragraph's top-level runs so that the characters covered by
+    `del_spans` (absolute offsets over the concatenated top-level run text)
+    become tracked deletions, and each `insertions[pos]` becomes a tracked
+    insertion anchored before the character at `pos` (pos == total length
+    appends at the end). Characters outside `del_spans` are re-emitted as
+    plain runs carrying their ORIGINAL run formatting; runs that need no
+    change at all are left completely untouched.
+    """
+    runs = paragraph.runs
+    if not runs:
+        # Pure insertion into an empty paragraph.
+        for pos in sorted(insertions):
+            paragraph._p.append(
+                _ins_el(None, insertions[pos], next_id(), author, date))
+        return
+    texts = [r.text for r in runs]
+    starts = []
+    acc = 0
+    for t in texts:
+        starts.append(acc)
+        acc += len(t)
+
+    def _deleted(p):
+        return any(s <= p < e for s, e in del_spans)
+
+    last = len(runs) - 1
+    for i, run in enumerate(runs):
+        rs = starts[i]
+        text = texts[i]
+        re_ = rs + len(text)
+        # Insertion anchors this run is responsible for: those falling inside
+        # it, plus (last run only) any anchored at/after the very end of text.
+        my_ins = {p: insertions[p] for p in insertions
+                  if rs <= p < re_ or (i == last and p >= re_)}
+        overlaps = any(s < re_ and e > rs for s, e in del_spans)
+        if not overlaps and not my_ins:
+            continue  # untouched run: original element and formatting survive
+        # Split points: run edges, deletion-span edges, insertion anchors.
+        bounds = {rs, re_}
+        for s, e in del_spans:
+            if rs < s < re_:
+                bounds.add(s)
+            if rs < e < re_:
+                bounds.add(e)
+        for p in my_ins:
+            if rs < p < re_:
+                bounds.add(p)
+        pts = sorted(bounds)
+
+        r_el = run._r
+        rpr = r_el.find(qn("w:rPr"))  # deep-copied inside the builders
+        new_els = []
+        for a, b in zip(pts, pts[1:]):
+            if a in my_ins:
+                new_els.append(_ins_el(rpr, my_ins.pop(a), next_id(), author, date))
+            seg = text[a - rs: b - rs]
+            if not seg:
+                continue
+            if _deleted(a):
+                new_els.append(_del_el(rpr, seg, next_id(), author, date))
+            else:
+                new_els.append(_normal_run_el(rpr, seg))
+        for p in sorted(my_ins):  # anchors at/after the end of the last run
+            new_els.append(_ins_el(rpr, my_ins[p], next_id(), author, date))
+        _replace_element(r_el, new_els)
+
+
 def _tracked_replace_in_paragraph(paragraph, find, replace, remaining, author, date, next_id):
     """
-    Tracked-changes equivalent of _replace_in_paragraph. For each match: delete
-    the matched text (wrapped in <w:del>) and, if `replace` is non-empty, insert
-    the new text (wrapped in <w:ins>) at the match position. Handles matches that
-    span multiple runs. Returns the number of matches processed.
-
-    Termination note: once matched text is wrapped in <w:del>/<w:ins> it is no
-    longer a direct child <w:r> of the paragraph, so paragraph.runs (which sees
-    only top-level runs) will not re-match it. Each pass therefore advances to
-    the next untracked occurrence, or stops.
+    Tracked-changes replace within one paragraph, recorded the way Word
+    itself records an edit: `find` and `replace` are DIFFED word-by-word and
+    only the words that actually change are wrapped in <w:del>/<w:ins>.
+    Unchanged words keep their original runs and formatting. Handles matches
+    spanning multiple runs. Returns the number of matches processed.
     """
-    made = 0
+    if find == replace:
+        return 0  # nothing would change; do not record empty revisions
+    full = "".join(r.text for r in paragraph.runs)
+    matches = []
+    start = 0
     while True:
-        if remaining is not None and made >= remaining:
+        if remaining is not None and len(matches) >= remaining:
             break
-        runs = paragraph.runs
-        if not runs:
+        i = full.find(find, start)
+        if i == -1:
             break
-        texts = [r.text for r in runs]
-        full = "".join(texts)
-        idx = full.find(find)
-        if idx == -1:
-            break
-        end = idx + len(find)
-
-        starts = []
-        acc = 0
-        for t in texts:
-            starts.append(acc)
-            acc += len(t)
-
-        # Runs overlapping the match [idx, end).
-        overlapping = [
-            i for i, t in enumerate(texts)
-            if not (starts[i] + len(t) <= idx or starts[i] >= end)
-        ]
-        first = overlapping[0]
-
-        for i in overlapping:
-            r_el = runs[i]._r
-            rpr = r_el.find(qn("w:rPr"))  # deep-copied inside builders before removal
-            text = texts[i]
-            rs = starts[i]
-            re_ = rs + len(text)
-            a = max(rs, idx)
-            b = min(re_, end)
-            before = text[: a - rs]
-            inside = text[a - rs: b - rs]
-            after = text[b - rs:]
-
-            new_els = []
-            if before:
-                new_els.append(_normal_run_el(rpr, before))
-            if i == first and replace:
-                # Insertion of the new text takes the formatting of the run
-                # where the match starts (documented cross-run trade-off).
-                new_els.append(_ins_el(rpr, replace, next_id(), author, date))
-            if inside:
-                new_els.append(_del_el(rpr, inside, next_id(), author, date))
-            if after:
-                new_els.append(_normal_run_el(rpr, after))
-
-            if new_els:
-                _replace_element(r_el, new_els)
-            else:
-                r_el.getparent().remove(r_el)
-        made += 1
-    return made
+        matches.append(i)
+        start = i + len(find)
+    if not matches:
+        return 0
+    del_spans, insertions = _word_diff(find, replace)
+    # Apply right-to-left so earlier match offsets stay valid: an edit at a
+    # later offset never moves characters that sit before it.
+    for idx in reversed(matches):
+        _apply_tracked_edit(
+            paragraph,
+            [(idx + s, idx + e) for s, e in del_spans],
+            {idx + p: t for p, t in insertions.items()},
+            author, date, next_id,
+        )
+    return len(matches)
 
 
-def _iter_revisions(doc):
-    """Yield (kind, element) for every top-level insertion/deletion revision."""
-    ins_tag, del_tag = qn("w:ins"), qn("w:del")
-    for el in doc.element.iter():
-        if el.tag == ins_tag:
-            yield "insertion", el
-        elif el.tag == del_tag:
-            yield "deletion", el
+def _is_mark_revision(el):
+    """True if this w:ins/w:del is a PARAGRAPH-MARK marker (inside pPr/rPr)."""
+    parent = el.getparent()
+    return (parent is not None and parent.tag == qn("w:rPr")
+            and parent.getparent() is not None
+            and parent.getparent().tag == qn("w:pPr"))
+
+
+def _ancestor_paragraph(el):
+    """The w:p element containing `el`, or None."""
+    p_tag = qn("w:p")
+    cur = el.getparent()
+    while cur is not None and cur.tag != p_tag:
+        cur = cur.getparent()
+    return cur
 
 
 def _revision_text(el):
@@ -553,43 +780,161 @@ def _revision_text(el):
     return "".join(parts)
 
 
-def _accept_all(doc):
-    """Accept every tracked change: keep inserted text, drop deleted text."""
-    ins_count = del_count = 0
-    for el in list(doc.element.iter(qn("w:ins"))):
+def _para_plain_text(p_el):
+    """All text of a paragraph element, including pending-deleted text."""
+    parts = []
+    for t in p_el.iter(qn("w:t"), qn("w:delText")):
+        parts.append(t.text or "")
+    return "".join(parts)
+
+
+def _body_para_index(doc, p_el):
+    """Index of p_el within the document body paragraphs, or None (in a table)."""
+    if p_el is None or p_el.getparent() is not doc.element.body:
+        return None
+    i = 0
+    for sib in doc.element.body.iterchildren(qn("w:p")):
+        if sib is p_el:
+            return i
+        i += 1
+    return None
+
+
+def _merge_paragraph_with_next(p_el):
+    """
+    Remove the paragraph break after p_el: its content flows into the FOLLOWING
+    paragraph, whose paragraph mark (and properties) survives - Word's own
+    semantics for accepting a deleted paragraph mark / rejecting an inserted
+    one. Falls back gracefully when there is no following paragraph.
+    """
+    pPr_tag, p_tag = qn("w:pPr"), qn("w:p")
+    nxt = p_el.getnext()
+    if nxt is not None and nxt.tag == p_tag:
+        idx = 1 if (len(nxt) and nxt[0].tag == pPr_tag) else 0
+        for child in [c for c in p_el if c.tag != pPr_tag]:
+            nxt.insert(idx, child)
+            idx += 1
+        p_el.getparent().remove(p_el)
+        return "merged"
+    # No following paragraph (end of body / cell): drop the paragraph if it is
+    # empty and not the only one, otherwise leave it in place.
+    parent = p_el.getparent()
+    has_content = any(c.tag != pPr_tag for c in p_el)
+    sibling_ps = [c for c in parent if c.tag == p_tag]
+    if not has_content and len(sibling_ps) > 1:
+        parent.remove(p_el)
+        return "removed"
+    return "kept"
+
+
+def _accept_revision(el):
+    """Accept one revision element. Returns 'insertion' or 'deletion'."""
+    kind = "insertion" if el.tag == qn("w:ins") else "deletion"
+    if _is_mark_revision(el):
+        p_el = _ancestor_paragraph(el)
+        el.getparent().remove(el)
+        if kind == "deletion" and p_el is not None:
+            _merge_paragraph_with_next(p_el)  # accepted deleted mark: merge
+        return kind
+    if kind == "insertion":
         parent = el.getparent()
         idx = parent.index(el)
         for child in list(el):          # promote the inserted runs to normal
             parent.insert(idx, child)
             idx += 1
         parent.remove(el)
-        ins_count += 1
-    for el in list(doc.element.iter(qn("w:del"))):
+    else:
         el.getparent().remove(el)       # deleted content disappears
-        del_count += 1
-    return ins_count, del_count
+    return kind
 
 
-def _reject_all(doc):
-    """Reject every tracked change: drop inserted text, restore deleted text."""
-    ins_count = del_count = 0
-    for el in list(doc.element.iter(qn("w:ins"))):
+def _reject_revision(el):
+    """Reject one revision element. Returns 'insertion' or 'deletion'."""
+    kind = "insertion" if el.tag == qn("w:ins") else "deletion"
+    if _is_mark_revision(el):
+        p_el = _ancestor_paragraph(el)
+        el.getparent().remove(el)
+        if kind == "insertion" and p_el is not None:
+            _merge_paragraph_with_next(p_el)  # rejected inserted mark: merge
+        return kind
+    if kind == "insertion":
         el.getparent().remove(el)       # inserted content disappears
-        ins_count += 1
-    for el in list(doc.element.iter(qn("w:del"))):
+    else:
         parent = el.getparent()
         idx = parent.index(el)
         for child in list(el):          # restore runs, delText -> t
             for dt in child.findall(qn("w:delText")):
                 t = OxmlElement("w:t")
-                t.set(_XML_SPACE, "preserve")
+                space = dt.get(_XML_SPACE)
+                t.set(_XML_SPACE, space if space else "preserve")
                 t.text = dt.text
                 child.replace(dt, t)
             parent.insert(idx, child)
             idx += 1
         parent.remove(el)
-        del_count += 1
-    return ins_count, del_count
+    return kind
+
+
+def _apply_revisions(doc, accept, ids=None):
+    """
+    Accept or reject revisions. ids=None means every revision; otherwise only
+    those whose w:id is in `ids`. Text-level revisions are processed before
+    paragraph-mark revisions so that paragraph merges see final content.
+    Returns ({"insertion": n, "deletion": n}, [ids_not_found]).
+    """
+    wanted = None if ids is None else {str(i) for i in ids}
+    found = set()
+    content, marks = [], []
+    for el in doc.element.iter(qn("w:ins"), qn("w:del")):
+        rid = el.get(qn("w:id"))
+        if wanted is not None:
+            if rid not in wanted:
+                continue
+            found.add(rid)
+        (marks if _is_mark_revision(el) else content).append(el)
+    counts = {"insertion": 0, "deletion": 0}
+    apply_fn = _accept_revision if accept else _reject_revision
+    for el in content + marks:
+        counts[apply_fn(el)] += 1
+    missing = sorted(wanted - found) if wanted is not None else []
+    return counts, missing
+
+
+# -----------------------------------------------------------------------------
+# FINAL-VIEW TEXT RENDERING
+#
+# python-docx's paragraph.text only sees TOP-LEVEL runs, so any text sitting
+# inside a pending <w:ins> is invisible to it (and pending deletions are
+# invisible too, because deleted text lives in <w:delText>). Reading a document
+# through that lens after tracked edits would make content appear to vanish.
+# These helpers render what Word's "No Markup" view shows: the document as it
+# would look with every pending change ACCEPTED - insertions included,
+# deletions omitted.
+# -----------------------------------------------------------------------------
+def _final_para_text(p_el):
+    """Paragraph text in the final (all-changes-accepted) view."""
+    parts = []
+    t_tag, tab_tag, br_tag = qn("w:t"), qn("w:tab"), qn("w:br")
+    for r in p_el.iter(qn("w:r")):
+        for child in r:
+            if child.tag == t_tag:
+                parts.append(child.text or "")
+            elif child.tag == tab_tag:
+                parts.append("\t")
+            elif child.tag == br_tag:
+                parts.append("\n")
+            # w:delText is skipped: pending deletion, gone once accepted.
+    return "".join(parts)
+
+
+def _final_cell_text(cell):
+    """Table-cell text in the final view (paragraphs joined by newlines)."""
+    return "\n".join(_final_para_text(p._p) for p in cell.paragraphs)
+
+
+def _count_pending_changes(doc):
+    """Number of tracked-change elements currently in the document."""
+    return sum(1 for _ in doc.element.iter(qn("w:ins"), qn("w:del")))
 
 
 def _render_linear_text(doc):
@@ -597,10 +942,10 @@ def _render_linear_text(doc):
     lines = []
     for block in _iter_block_items(doc):
         if isinstance(block, Paragraph):
-            lines.append(block.text)
+            lines.append(_final_para_text(block._p))
         elif isinstance(block, Table):
             for row in block.rows:
-                lines.append(" | ".join(cell.text for cell in row.cells))
+                lines.append(" | ".join(_final_cell_text(cell) for cell in row.cells))
     return "\n".join(lines)
 
 
@@ -620,7 +965,7 @@ def _render_structured(doc):
                 "type": "paragraph",
                 "para_index": p_i,
                 "style": block.style.name if block.style is not None else None,
-                "text": block.text,
+                "text": _final_para_text(block._p),
             })
             p_i += 1
         elif isinstance(block, Table):
@@ -695,10 +1040,13 @@ def tool_get_content(args):
     session = _get_session(args)
     doc = session["doc"]
     mode = args.get("mode", "text")
+    pending = _count_pending_changes(doc)
     if mode == "text":
-        return {"mode": "text", "content": _render_linear_text(doc)}
+        return {"mode": "text", "content": _render_linear_text(doc),
+                "pending_changes": pending}
     elif mode == "structured":
-        return {"mode": "structured", "blocks": _render_structured(doc)}
+        return {"mode": "structured", "blocks": _render_structured(doc),
+                "pending_changes": pending}
     else:
         raise ToolError("mode must be 'text' or 'structured' (got '{}')".format(mode))
 
@@ -737,14 +1085,16 @@ def tool_search(args):
 
     matches = []
 
-    # Body paragraphs (addressable by para_index).
+    # Body paragraphs (addressable by para_index). Final view: text inside
+    # pending insertions is searchable, pending-deleted text is not.
     for p_i, p in enumerate(doc.paragraphs):
-        for pos in _hits(p.text):
+        ptext = _final_para_text(p._p)
+        for pos in _hits(ptext):
             matches.append({
                 "location": "body_paragraph",
                 "para_index": p_i,
                 "char_offset": pos,
-                "snippet": _snippet(p.text, pos),
+                "snippet": _snippet(ptext, pos),
             })
             if max_results and len(matches) >= max_results:
                 return {"query": query, "matches": matches, "truncated": True}
@@ -753,14 +1103,15 @@ def tool_search(args):
     for t_i, tbl in enumerate(doc.tables):
         for r_i, row in enumerate(tbl.rows):
             for c_i, cell in enumerate(row.cells):
-                for pos in _hits(cell.text):
+                ctext = _final_cell_text(cell)
+                for pos in _hits(ctext):
                     matches.append({
                         "location": "table_cell",
                         "table_index": t_i,
                         "row": r_i,
                         "col": c_i,
                         "char_offset": pos,
-                        "snippet": _snippet(cell.text, pos),
+                        "snippet": _snippet(ctext, pos),
                     })
                     if max_results and len(matches) >= max_results:
                         return {"query": query, "matches": matches, "truncated": True}
@@ -804,6 +1155,150 @@ def tool_replace_text(args):
         result["author"] = author
         result["date"] = date
     return result
+
+
+def _has_pending_revisions(p_el):
+    """True if the paragraph already contains any tracked change."""
+    for _ in p_el.iter(qn("w:ins"), qn("w:del")):
+        return True
+    return False
+
+
+def tool_set_paragraph_text(args):
+    """
+    Replace the entire text of one body paragraph. Tracked mode diffs old vs
+    new word-by-word, so only the words that actually change become revisions.
+    """
+    session = _get_session(args)
+    doc = session["doc"]
+    para_index = int(_require(args, "para_index"))
+    if not 0 <= para_index < len(doc.paragraphs):
+        raise ToolError(
+            "para_index out of range (0..{}).".format(len(doc.paragraphs) - 1)
+        )
+    new_text = _require(args, "text")
+    if not isinstance(new_text, str):
+        raise ToolError("'text' must be a string")
+    paragraph = doc.paragraphs[para_index]
+    track = bool(args.get("track_changes", False))
+
+    if not track:
+        # Silent rewrite: drop all content children (runs, hyperlinks, any
+        # pending revisions), keep the paragraph properties/style.
+        for child in list(paragraph._p):
+            if child.tag != qn("w:pPr"):
+                paragraph._p.remove(child)
+        if new_text:
+            paragraph.add_run(new_text)
+        return {"para_index": para_index, "tracked": False, "text": new_text}
+
+    warning = None
+    if _has_pending_revisions(paragraph._p):
+        warning = ("Paragraph already contains pending tracked changes; the "
+                   "diff was computed against its unrevised text only. "
+                   "Accept/reject existing changes first for a clean result.")
+    old_text = "".join(r.text for r in paragraph.runs)
+    if old_text == new_text:
+        return {"para_index": para_index, "tracked": True, "changed": False}
+    author = args.get("author") or AUTHOR
+    date = _today_iso()
+    next_id = _make_rev_id_allocator(doc)
+    del_spans, insertions = _word_diff(old_text, new_text)
+    _apply_tracked_edit(paragraph, del_spans, insertions, author, date, next_id)
+    result = {"para_index": para_index, "tracked": True, "changed": True,
+              "author": author, "date": date,
+              "deleted_spans": len(del_spans), "inserted_spans": len(insertions)}
+    if warning:
+        result["warning"] = warning
+    return result
+
+
+def tool_insert_paragraph(args):
+    """
+    Insert a new paragraph before/after a body paragraph (or append at the
+    end). Tracked mode marks the text AND the paragraph mark as inserted, so
+    rejecting removes the whole paragraph - Word's native behaviour.
+    """
+    session = _get_session(args)
+    doc = session["doc"]
+    text = args.get("text", "")
+    style = args.get("style")
+    position = args.get("position", "after")
+    if position not in ("before", "after"):
+        raise ToolError("position must be 'before' or 'after'")
+    para_index = args.get("para_index")
+
+    try:
+        if para_index is None:
+            new_p = doc.add_paragraph(text, style=style)
+        else:
+            para_index = int(para_index)
+            if not 0 <= para_index < len(doc.paragraphs):
+                raise ToolError(
+                    "para_index out of range (0..{}).".format(len(doc.paragraphs) - 1)
+                )
+            ref = doc.paragraphs[para_index]
+            new_p = ref.insert_paragraph_before(text, style)
+            if position == "after":
+                ref._p.addnext(new_p._p)  # relocate: after the anchor instead
+    except KeyError:
+        raise ToolError("Unknown paragraph style: '{}'".format(style))
+
+    track = bool(args.get("track_changes", False))
+    author = args.get("author") or AUTHOR
+    date = _today_iso()
+    if track:
+        next_id = _make_rev_id_allocator(doc)
+        for r_el in [r._r for r in new_p.runs]:
+            _wrap_run_in_ins(r_el, next_id(), author, date)
+        _mark_para_boundary(new_p._p, "w:ins", next_id(), author, date)
+
+    new_index = next(
+        i for i, p in enumerate(doc.paragraphs) if p._p is new_p._p
+    )
+    result = {"para_index": new_index, "text": text, "tracked": track}
+    if track:
+        result["author"] = author
+        result["date"] = date
+    return result
+
+
+def tool_delete_paragraph(args):
+    """
+    Delete a body paragraph. Tracked mode marks the text AND the paragraph
+    mark as deleted (shown struck out; accepting removes the paragraph and
+    merges with the next, rejecting restores it) - Word's native behaviour.
+    """
+    session = _get_session(args)
+    doc = session["doc"]
+    para_index = int(_require(args, "para_index"))
+    if not 0 <= para_index < len(doc.paragraphs):
+        raise ToolError(
+            "para_index out of range (0..{}).".format(len(doc.paragraphs) - 1)
+        )
+    paragraph = doc.paragraphs[para_index]
+    preview = paragraph.text
+    track = bool(args.get("track_changes", False))
+
+    if track:
+        author = args.get("author") or AUTHOR
+        date = _today_iso()
+        next_id = _make_rev_id_allocator(doc)
+        for r_el in [r._r for r in paragraph.runs]:
+            _wrap_run_in_del(r_el, next_id(), author, date)
+        _mark_para_boundary(paragraph._p, "w:del", next_id(), author, date)
+        return {"para_index": para_index, "tracked": True, "author": author,
+                "date": date, "text": preview}
+
+    body = doc.element.body
+    if (paragraph._p.getparent() is body
+            and len(body.findall(qn("w:p"))) <= 1):
+        raise ToolError(
+            "Refusing to delete the document's only paragraph "
+            "(a body should keep at least one). Clear its text instead."
+        )
+    paragraph._p.getparent().remove(paragraph._p)
+    return {"para_index": para_index, "tracked": False, "text": preview}
 
 
 def tool_add_paragraph(args):
@@ -976,27 +1471,67 @@ def tool_list_changes(args):
     session = _get_session(args)
     doc = session["doc"]
     changes = []
-    for kind, el in _iter_revisions(doc):
+    for el in doc.element.iter(qn("w:ins"), qn("w:del")):
+        mark = _is_mark_revision(el)
+        p_el = _ancestor_paragraph(el)
+        para_text = _para_plain_text(p_el) if p_el is not None else ""
         changes.append({
-            "type": kind,
+            "type": "insertion" if el.tag == qn("w:ins") else "deletion",
+            # 'text' = words inserted/deleted; 'paragraph_mark' = the pilcrow
+            # itself (a whole-paragraph insert/delete carries one of each).
+            "scope": "paragraph_mark" if mark else "text",
             "id": el.get(qn("w:id")),
             "author": el.get(qn("w:author")),
             "date": el.get(qn("w:date")),
-            "text": _revision_text(el),
+            "text": "" if mark else _revision_text(el),
+            "para_index": _body_para_index(doc, p_el),  # None = inside a table
+            "paragraph_text": (para_text[:117] + "...") if len(para_text) > 120
+                              else para_text,
         })
     return {"changes": changes, "count": len(changes)}
 
 
+def _ids_arg(args):
+    ids = _require(args, "ids")
+    if not isinstance(ids, list) or not ids:
+        raise ToolError("'ids' must be a non-empty array of change ids")
+    return ids
+
+
+def tool_accept_changes(args):
+    session = _get_session(args)
+    counts, missing = _apply_revisions(session["doc"], accept=True,
+                                       ids=_ids_arg(args))
+    result = {"accepted_insertions": counts["insertion"],
+              "accepted_deletions": counts["deletion"]}
+    if missing:
+        result["ids_not_found"] = missing
+    return result
+
+
+def tool_reject_changes(args):
+    session = _get_session(args)
+    counts, missing = _apply_revisions(session["doc"], accept=False,
+                                       ids=_ids_arg(args))
+    result = {"rejected_insertions": counts["insertion"],
+              "rejected_deletions": counts["deletion"]}
+    if missing:
+        result["ids_not_found"] = missing
+    return result
+
+
 def tool_accept_all_changes(args):
     session = _get_session(args)
-    ins_count, del_count = _accept_all(session["doc"])
-    return {"accepted_insertions": ins_count, "accepted_deletions": del_count}
+    counts, _ = _apply_revisions(session["doc"], accept=True)
+    return {"accepted_insertions": counts["insertion"],
+            "accepted_deletions": counts["deletion"]}
 
 
 def tool_reject_all_changes(args):
     session = _get_session(args)
-    ins_count, del_count = _reject_all(session["doc"])
-    return {"rejected_insertions": ins_count, "rejected_deletions": del_count}
+    counts, _ = _apply_revisions(session["doc"], accept=False)
+    return {"rejected_insertions": counts["insertion"],
+            "rejected_deletions": counts["deletion"]}
 
 
 # =============================================================================
@@ -1033,7 +1568,7 @@ TOOLS = [
     },
     {
         "name": "msword_get_content",
-        "description": "Read a document. mode='text' returns linear plain text (tables flattened); mode='structured' returns an ordered block list with para_index/table_index for addressing.",
+        "description": "Read a document. mode='text' returns linear plain text (tables flattened); mode='structured' returns an ordered block list with para_index/table_index for addressing. Text is the FINAL view (pending tracked insertions shown, pending deletions hidden - like Word's 'No Markup'); the result's pending_changes count says whether revisions are outstanding.",
         "handler": tool_get_content,
         "inputSchema": {
             "type": "object",
@@ -1061,7 +1596,7 @@ TOOLS = [
     },
     {
         "name": "msword_replace_text",
-        "description": "Replace text across body paragraphs and table cells. Handles matches spanning multiple runs. Set track_changes=true to record each replacement as a Word tracked change (deletion of old text + insertion of new) instead of editing silently. An empty 'replace' with track_changes=true is a tracked deletion.",
+        "description": "Replace text across body paragraphs and table cells. Handles matches spanning multiple runs. Set track_changes=true to record the edit as Word tracked changes: find/replace are diffed word-by-word so only the words that actually change are marked as deleted/inserted (like editing in Word with Track Changes on) - safe to pass whole sentences or paragraphs. An empty 'replace' with track_changes=true is a tracked deletion.",
         "handler": tool_replace_text,
         "inputSchema": {
             "type": "object",
@@ -1074,6 +1609,55 @@ TOOLS = [
                 "author": {"type": "string", "description": "Override the tracked-change author for this call (defaults to the server's --author)."},
             },
             "required": ["session_id", "find"],
+        },
+    },
+    {
+        "name": "msword_set_paragraph_text",
+        "description": "Replace the entire text of one body paragraph (para_index from get_content structured). With track_changes=true the old and new text are diffed word-by-word and only the changed words become tracked deletions/insertions - use this to 'rewrite this paragraph' as a clean Word revision. Untracked, it silently replaces the paragraph's content (keeping its style).",
+        "handler": tool_set_paragraph_text,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "para_index": {"type": "integer"},
+                "text": {"type": "string", "description": "The paragraph's full new text ('' deletes all its text)."},
+                "track_changes": {"type": "boolean", "default": False},
+                "author": {"type": "string", "description": "Override the tracked-change author for this call."},
+            },
+            "required": ["session_id", "para_index", "text"],
+        },
+    },
+    {
+        "name": "msword_insert_paragraph",
+        "description": "Insert a new paragraph before/after a body paragraph (omit para_index to append at the end). With track_changes=true the text AND the paragraph mark are recorded as a Word tracked insertion, so rejecting the change removes the whole paragraph.",
+        "handler": tool_insert_paragraph,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "text": {"type": "string", "default": ""},
+                "para_index": {"type": "integer", "description": "Anchor paragraph; omit to append at the document end."},
+                "position": {"type": "string", "enum": ["before", "after"], "default": "after"},
+                "style": {"type": "string", "description": "Optional paragraph style, e.g. 'Normal', 'Heading 2'."},
+                "track_changes": {"type": "boolean", "default": False},
+                "author": {"type": "string", "description": "Override the tracked-change author for this call."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "msword_delete_paragraph",
+        "description": "Delete a body paragraph. With track_changes=true the text AND the paragraph mark are recorded as a Word tracked deletion (text shows struck out; accepting removes the paragraph entirely, rejecting restores it). Untracked, the paragraph is removed immediately.",
+        "handler": tool_delete_paragraph,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "para_index": {"type": "integer"},
+                "track_changes": {"type": "boolean", "default": False},
+                "author": {"type": "string", "description": "Override the tracked-change author for this call."},
+            },
+            "required": ["session_id", "para_index"],
         },
     },
     {
@@ -1170,7 +1754,7 @@ TOOLS = [
     },
     {
         "name": "msword_list_changes",
-        "description": "List all tracked changes (insertions and deletions) currently in the document, with author, date and text.",
+        "description": "List every tracked change in the document with id, author, date, changed text, scope ('text', or 'paragraph_mark' for an inserted/deleted pilcrow - a whole-paragraph insert/delete has one of each), para_index (None = inside a table) and surrounding paragraph text. The ids feed msword_accept_changes / msword_reject_changes.",
         "handler": tool_list_changes,
         "inputSchema": {
             "type": "object",
@@ -1179,8 +1763,36 @@ TOOLS = [
         },
     },
     {
+        "name": "msword_accept_changes",
+        "description": "Accept specific tracked changes by id (from msword_list_changes): inserted text becomes normal text, deleted text is removed. Accepting a deleted paragraph mark merges the paragraph with the following one, as Word does.",
+        "handler": tool_accept_changes,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "ids": {"type": "array", "items": {"type": "string"},
+                        "description": "Change ids to accept."},
+            },
+            "required": ["session_id", "ids"],
+        },
+    },
+    {
+        "name": "msword_reject_changes",
+        "description": "Reject specific tracked changes by id (from msword_list_changes): inserted text is removed, deleted text is restored. Rejecting an inserted paragraph mark removes that paragraph break, as Word does.",
+        "handler": tool_reject_changes,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "ids": {"type": "array", "items": {"type": "string"},
+                        "description": "Change ids to reject."},
+            },
+            "required": ["session_id", "ids"],
+        },
+    },
+    {
         "name": "msword_accept_all_changes",
-        "description": "Accept every tracked change: inserted text is kept as normal text and deleted text is removed.",
+        "description": "Accept every tracked change: inserted text/paragraphs are kept as normal content and deleted text/paragraphs are removed.",
         "handler": tool_accept_all_changes,
         "inputSchema": {
             "type": "object",
@@ -1190,7 +1802,7 @@ TOOLS = [
     },
     {
         "name": "msword_reject_all_changes",
-        "description": "Reject every tracked change: inserted text is removed and deleted text is restored.",
+        "description": "Reject every tracked change: inserted text/paragraphs are removed and deleted text/paragraphs are restored.",
         "handler": tool_reject_all_changes,
         "inputSchema": {
             "type": "object",
@@ -1373,7 +1985,7 @@ def run_check():
 
         print("[check] round-trip: PASS")
 
-        # --- Tracked-changes round-trip -------------------------------------
+        # --- Tracked changes 1: simple word replace, accept + reject --------
         tpath = os.path.join(tmpdir, "tracked.docx")
         td = docx.Document()
         td.add_paragraph("The report is DRAFT and confidential.")
@@ -1392,6 +2004,10 @@ def run_check():
             "expected one insertion + one deletion, got {}".format(kinds)
         assert all(c["author"] == "Self Test" for c in listed["changes"]), \
             "author not stamped"
+        assert all(c["scope"] == "text" for c in listed["changes"]), \
+            "unexpected paragraph-mark change"
+        assert all(c["para_index"] == 0 for c in listed["changes"]), \
+            "para_index wrong in list_changes"
 
         tpath2 = os.path.join(tmpdir, "tracked2.docx")
         tool_save({"session_id": tsid, "path": tpath2})
@@ -1402,6 +2018,8 @@ def run_check():
         tool_accept_all_changes({"session_id": a["session_id"]})
         atext = tool_get_content({"session_id": a["session_id"], "mode": "text"})["content"]
         assert "FINAL" in atext and "DRAFT" not in atext, "accept-all wrong"
+        assert tool_list_changes({"session_id": a["session_id"]})["count"] == 0, \
+            "changes left after accept-all"
         tool_close({"session_id": a["session_id"]})
 
         # Reject path: DRAFT restored, FINAL gone.
@@ -1411,7 +2029,233 @@ def run_check():
         assert "DRAFT" in rtext and "FINAL" not in rtext, "reject-all wrong"
         tool_close({"session_id": r["session_id"]})
 
-        print("[check] tracked-changes: PASS")
+        print("[check] tracked-changes basic: PASS")
+
+        # --- Tracked changes 2: word-level diff on a whole-sentence replace -
+        # The review record must contain ONLY the changed words, never the
+        # whole sentence as one deletion + one insertion.
+        old_s = "The quick brown fox jumps over the lazy dog."
+        new_s = "The quick red fox leaps over the lazy dog."
+        d2path = os.path.join(tmpdir, "diff.docx")
+        d2 = docx.Document()
+        d2.add_paragraph(old_s)
+        d2.save(d2path)
+        s2 = tool_open({"path": d2path})["session_id"]
+        rt = tool_replace_text({"session_id": s2, "find": old_s, "replace": new_s,
+                                "track_changes": True, "author": "Self Test"})
+        assert rt["replacements"] == 1, "sentence replace failed"
+        ch = tool_list_changes({"session_id": s2})["changes"]
+        dels = sorted(c["text"] for c in ch if c["type"] == "deletion")
+        inss = sorted(c["text"] for c in ch if c["type"] == "insertion")
+        assert dels == ["brown", "jumps"], \
+            "diff not word-level, deletions: {}".format(dels)
+        assert inss == ["leaps", "red"], \
+            "diff not word-level, insertions: {}".format(inss)
+        tool_accept_all_changes({"session_id": s2})
+        t2 = tool_get_content({"session_id": s2, "mode": "text"})["content"]
+        assert new_s in t2, "accepted diff text wrong"
+        tool_close({"session_id": s2})
+
+        # Pure insertion inside a match must terminate and land correctly.
+        d3path = os.path.join(tmpdir, "insonly.docx")
+        d3 = docx.Document()
+        d3.add_paragraph("Feed the lazy dog today.")
+        d3.save(d3path)
+        s3 = tool_open({"path": d3path})["session_id"]
+        rt = tool_replace_text({"session_id": s3, "find": "lazy dog",
+                                "replace": "lazy old dog",
+                                "track_changes": True})
+        assert rt["replacements"] == 1, "insert-only replace failed"
+        tool_accept_all_changes({"session_id": s3})
+        t3 = tool_get_content({"session_id": s3, "mode": "text"})["content"]
+        assert "Feed the lazy old dog today." in t3, "insert-only result wrong"
+        tool_close({"session_id": s3})
+
+        # Formatting on unchanged words must survive (multi-run match).
+        d4path = os.path.join(tmpdir, "fmt.docx")
+        d4 = docx.Document()
+        p4 = d4.add_paragraph("")
+        r4 = p4.add_run("Alpha ")
+        r4.bold = True
+        p4.add_run("beta gamma")
+        d4.save(d4path)
+        s4 = tool_open({"path": d4path})["session_id"]
+        tool_replace_text({"session_id": s4, "find": "Alpha beta",
+                           "replace": "Alpha delta", "track_changes": True})
+        doc4 = SESSIONS[s4]["doc"]
+        first_run = doc4.paragraphs[0].runs[0]
+        assert first_run.text == "Alpha " and first_run.bold, \
+            "unchanged bold run was disturbed by the diff"
+        tool_accept_all_changes({"session_id": s4})
+        t4 = tool_get_content({"session_id": s4, "mode": "text"})["content"]
+        assert "Alpha delta gamma" in t4, "multi-run diff accept wrong"
+        tool_close({"session_id": s4})
+
+        print("[check] tracked-changes word-diff: PASS")
+
+        # --- Tracked changes 3: set_paragraph_text (rewrite a paragraph) ----
+        d5path = os.path.join(tmpdir, "setpara.docx")
+        d5 = docx.Document()
+        d5.add_paragraph("One two three four")
+        d5.save(d5path)
+        s5 = tool_open({"path": d5path})["session_id"]
+        tool_set_paragraph_text({"session_id": s5, "para_index": 0,
+                                 "text": "One 2 three four five",
+                                 "track_changes": True})
+        ch = tool_list_changes({"session_id": s5})["changes"]
+        dels = sorted(c["text"] for c in ch if c["type"] == "deletion")
+        inss = sorted(c["text"] for c in ch if c["type"] == "insertion")
+        assert dels == ["two"], "set_paragraph_text deletions: {}".format(dels)
+        assert inss == [" five", "2"], \
+            "set_paragraph_text insertions: {}".format(inss)
+        tool_accept_all_changes({"session_id": s5})
+        t5 = tool_get_content({"session_id": s5, "mode": "text"})["content"]
+        assert "One 2 three four five" in t5, "set_paragraph_text accept wrong"
+        tool_close({"session_id": s5})
+
+        # --- Tracked changes 4: paragraph insert/delete incl. the mark ------
+        def _three_para_doc(name):
+            pth = os.path.join(tmpdir, name)
+            dd = docx.Document()
+            dd.add_paragraph("One")
+            dd.add_paragraph("Three")
+            dd.save(pth)
+            return pth
+
+        # Inserted paragraph: reject-all must remove it entirely.
+        s6 = tool_open({"path": _three_para_doc("pins.docx")})["session_id"]
+        ins_res = tool_insert_paragraph({"session_id": s6, "text": "Two",
+                                         "para_index": 0, "position": "after",
+                                         "track_changes": True})
+        assert ins_res["para_index"] == 1, "inserted paragraph at wrong index"
+        doc6 = SESSIONS[s6]["doc"]
+        # Final view: pending-inserted text must be visible when reading.
+        assert [_final_para_text(p._p) for p in doc6.paragraphs] == \
+            ["One", "Two", "Three"], "inserted paragraph not in final view"
+        ch = tool_list_changes({"session_id": s6})["changes"]
+        assert any(c["scope"] == "paragraph_mark" and c["type"] == "insertion"
+                   for c in ch), "paragraph mark not tracked as inserted"
+        p6path = os.path.join(tmpdir, "pins2.docx")
+        tool_save({"session_id": s6, "path": p6path})
+        tool_close({"session_id": s6})
+
+        s6r = tool_open({"path": p6path})["session_id"]
+        tool_reject_all_changes({"session_id": s6r})
+        doc6r = SESSIONS[s6r]["doc"]
+        assert [p.text for p in doc6r.paragraphs] == ["One", "Three"], \
+            "rejected inserted paragraph did not disappear"
+        tool_close({"session_id": s6r})
+
+        s6a = tool_open({"path": p6path})["session_id"]
+        tool_accept_all_changes({"session_id": s6a})
+        doc6a = SESSIONS[s6a]["doc"]
+        assert [p.text for p in doc6a.paragraphs] == ["One", "Two", "Three"], \
+            "accepted inserted paragraph wrong"
+        assert tool_list_changes({"session_id": s6a})["count"] == 0
+        tool_close({"session_id": s6a})
+
+        # Deleted paragraph: accept-all must remove it entirely.
+        p7path = os.path.join(tmpdir, "pdel.docx")
+        d7 = docx.Document()
+        d7.add_paragraph("One")
+        d7.add_paragraph("Two")
+        d7.add_paragraph("Three")
+        d7.save(p7path)
+        s7 = tool_open({"path": p7path})["session_id"]
+        tool_delete_paragraph({"session_id": s7, "para_index": 1,
+                               "track_changes": True})
+        ch = tool_list_changes({"session_id": s7})["changes"]
+        assert any(c["scope"] == "paragraph_mark" and c["type"] == "deletion"
+                   for c in ch), "paragraph mark not tracked as deleted"
+        assert any(c["scope"] == "text" and c["text"] == "Two"
+                   for c in ch), "paragraph text not tracked as deleted"
+        p7path2 = os.path.join(tmpdir, "pdel2.docx")
+        tool_save({"session_id": s7, "path": p7path2})
+        tool_close({"session_id": s7})
+
+        s7a = tool_open({"path": p7path2})["session_id"]
+        tool_accept_all_changes({"session_id": s7a})
+        doc7a = SESSIONS[s7a]["doc"]
+        assert [p.text for p in doc7a.paragraphs] == ["One", "Three"], \
+            "accepted deleted paragraph did not disappear"
+        tool_close({"session_id": s7a})
+
+        s7r = tool_open({"path": p7path2})["session_id"]
+        tool_reject_all_changes({"session_id": s7r})
+        doc7r = SESSIONS[s7r]["doc"]
+        assert [p.text for p in doc7r.paragraphs] == ["One", "Two", "Three"], \
+            "rejected deleted paragraph not restored"
+        tool_close({"session_id": s7r})
+
+        # End-of-document edges: the FINAL paragraph mark is permanent in
+        # Word, so deleting the last paragraph / appending a paragraph must
+        # mark the PREVIOUS paragraph's pilcrow instead.
+        p9path = os.path.join(tmpdir, "plast.docx")
+        d9 = docx.Document()
+        d9.add_paragraph("One")
+        d9.add_paragraph("Two")
+        d9.save(p9path)
+        s9 = tool_open({"path": p9path})["session_id"]
+        tool_delete_paragraph({"session_id": s9, "para_index": 1,
+                               "track_changes": True})
+        p9path2 = os.path.join(tmpdir, "plast2.docx")
+        tool_save({"session_id": s9, "path": p9path2})
+        tool_close({"session_id": s9})
+        s9a = tool_open({"path": p9path2})["session_id"]
+        tool_accept_all_changes({"session_id": s9a})
+        assert [p.text for p in SESSIONS[s9a]["doc"].paragraphs] == ["One"], \
+            "accepted delete-of-last-paragraph wrong"
+        tool_close({"session_id": s9a})
+        s9r = tool_open({"path": p9path2})["session_id"]
+        tool_reject_all_changes({"session_id": s9r})
+        assert [p.text for p in SESSIONS[s9r]["doc"].paragraphs] == ["One", "Two"], \
+            "rejected delete-of-last-paragraph wrong"
+        tool_close({"session_id": s9r})
+
+        s10 = tool_open({"path": p9path})["session_id"]
+        tool_insert_paragraph({"session_id": s10, "text": "Appended",
+                               "track_changes": True})
+        p10path = os.path.join(tmpdir, "pappend.docx")
+        tool_save({"session_id": s10, "path": p10path})
+        tool_close({"session_id": s10})
+        s10r = tool_open({"path": p10path})["session_id"]
+        tool_reject_all_changes({"session_id": s10r})
+        assert [p.text for p in SESSIONS[s10r]["doc"].paragraphs] == ["One", "Two"], \
+            "rejected appended paragraph wrong"
+        tool_close({"session_id": s10r})
+        s10a = tool_open({"path": p10path})["session_id"]
+        tool_accept_all_changes({"session_id": s10a})
+        assert [p.text for p in SESSIONS[s10a]["doc"].paragraphs] == \
+            ["One", "Two", "Appended"], "accepted appended paragraph wrong"
+        tool_close({"session_id": s10a})
+
+        print("[check] tracked-changes paragraphs: PASS")
+
+        # --- Tracked changes 5: accept/reject individual changes by id ------
+        p8path = os.path.join(tmpdir, "byid.docx")
+        d8 = docx.Document()
+        d8.add_paragraph("Alpha Bravo")
+        d8.add_paragraph("Charlie Delta")
+        d8.save(p8path)
+        s8 = tool_open({"path": p8path})["session_id"]
+        tool_replace_text({"session_id": s8, "find": "Bravo",
+                           "replace": "Bravissimo", "track_changes": True})
+        tool_replace_text({"session_id": s8, "find": "Charlie",
+                           "replace": "Charles", "track_changes": True})
+        ch = tool_list_changes({"session_id": s8})["changes"]
+        ids_p0 = [c["id"] for c in ch if c["para_index"] == 0]
+        ids_p1 = [c["id"] for c in ch if c["para_index"] == 1]
+        assert ids_p0 and ids_p1, "per-paragraph ids not found"
+        tool_accept_changes({"session_id": s8, "ids": ids_p0})
+        tool_reject_changes({"session_id": s8, "ids": ids_p1})
+        t8 = tool_get_content({"session_id": s8, "mode": "text"})["content"]
+        assert "Alpha Bravissimo" in t8, "accept-by-id wrong"
+        assert "Charlie Delta" in t8 and "Charles" not in t8, "reject-by-id wrong"
+        assert tool_list_changes({"session_id": s8})["count"] == 0, \
+            "changes left after per-id accept/reject"
+        tool_close({"session_id": s8})
+
+        print("[check] tracked-changes accept/reject by id: PASS")
     except Exception as e:
         ok = False
         print("[check] round-trip: FAIL -> {}".format(e))
