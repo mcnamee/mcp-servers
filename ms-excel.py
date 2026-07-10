@@ -121,7 +121,7 @@ MAX_CELL_TEXT_LEN = 500      # long cell text is truncated to this many chars
 
 # Server identity reported to the client.
 SERVER_NAME = "excel-readonly"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.0.1"
 PROTOCOL_VERSION = "2024-11-05"
 
 # ===========================================================================
@@ -1163,9 +1163,12 @@ def serve(folder):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Read-only Excel (.xlsx) MCP server for VSCode Continue.")
-    parser.add_argument("--folder", default=WORKBOOK_FOLDER,
-                        help="Folder containing .xlsx/.xlsm workbooks "
-                             "(default from CONFIG block).")
+    parser.add_argument("--folder",
+                        default=os.environ.get("EXCEL_WORKBOOK_FOLDER",
+                                               WORKBOOK_FOLDER),
+                        help="Folder containing .xlsx/.xlsm workbooks. Falls "
+                             "back to the EXCEL_WORKBOOK_FOLDER environment "
+                             "variable, then the CONFIG block default.")
     parser.add_argument("--check", action="store_true",
                         help="Print environment/config diagnostics and exit.")
     parser.add_argument("--list", action="store_true",

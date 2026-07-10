@@ -51,15 +51,18 @@ known "already connected to transport" reconnection bug.
 
 ### confluence.py
 
-Configuration is via environment variables (or the equivalent CLI flags,
-which take priority over the env vars).
+Configuration is via environment variables (non-secret settings also have
+equivalent CLI flags, which take priority over the env vars). **Credentials
+are env-var only** — there are deliberately no `--token`/`--user`/`--password`
+flags, because command-line arguments are visible to other local users in
+process listings.
 
 | Env var | CLI flag | Purpose |
 |---|---|---|
 | `CONFLUENCE_BASE_URL` | `--base-url` | Base URL incl. any context path, no trailing slash |
-| `CONFLUENCE_TOKEN` | `--token` | Personal Access Token, sent as Bearer (preferred over basic auth) |
-| `CONFLUENCE_USER` | `--user` | Username for basic auth (fallback if no token) |
-| `CONFLUENCE_PASSWORD` | `--password` | Password for basic auth |
+| `CONFLUENCE_TOKEN` | _(env only)_ | Personal Access Token, sent as Bearer (preferred over basic auth) |
+| `CONFLUENCE_USER` | _(env only)_ | Username for basic auth (fallback if no token) |
+| `CONFLUENCE_PASSWORD` | _(env only)_ | Password for basic auth |
 | `CONFLUENCE_CA_CERT` | `--ca-cert` | Path to a PEM CA bundle for an internal CA |
 | `CONFLUENCE_VERIFY_SSL=false` | `--insecure` | Disable TLS certificate verification |
 | `CONFLUENCE_TIMEOUT` | `--timeout` | Request timeout in seconds (default 30) |
@@ -155,7 +158,7 @@ mcpServers:
 
 | CLI flag | Purpose |
 |---|---|
-| `--folder` | Folder of `.xlsx`/`.xlsm` workbooks to expose (default set in the CONFIG block in the file) |
+| `--folder` | Folder of `.xlsx`/`.xlsm` workbooks to expose. Falls back to the `EXCEL_WORKBOOK_FOLDER` env var, then the CONFIG block default in the file |
 | `--check` | Print environment/config diagnostics and exit (no server) |
 | `--list` | List readable workbooks in the folder and exit (no server) |
 
@@ -178,10 +181,17 @@ running, and logged into a profile.
 
 | CLI flag | Purpose |
 |---|---|
-| `--blacklist-file` | Path to a file of extra content-blacklist terms (one per line, `#` for comments), added to the built-in list |
-| `--search-folders` | Comma-separated folder names used as the **default** folder set for `outlook_search_recent`, overriding the `SEARCH_ALL_FOLDERS` value in the file (e.g. `"Inbox,Sent Items,Archive"`). A per-call `folders` argument still takes priority |
+| `--blacklist-file` | Path to a file of extra content-blacklist terms (one per line, `#` for comments), added to the built-in list. Falls back to the `OUTLOOK_BLACKLIST_FILE` env var |
+| `--search-folders` | Comma-separated folder names used as the **default** folder set for `outlook_search_recent`, overriding the `SEARCH_ALL_FOLDERS` value in the file (e.g. `"Inbox,Sent Items,Archive"`). A per-call `folders` argument still takes priority. Falls back to the `OUTLOOK_SEARCH_FOLDERS` env var |
+| `--require-blacklist` | Fail closed: refuse to start unless the content blacklist has at least one active term, so a missing/empty terms file cannot silently disable the compliance filter. Also via `OUTLOOK_REQUIRE_BLACKLIST=1` or the `REQUIRE_BLACKLIST` constant in the file |
 | `--check` | Connect to Outlook, print diagnostics + blacklist status to stderr, then exit (no server) |
 | `--version` | Print version and exit |
+
+The content blacklist also applies to **folder names**: folders whose
+store/path matches a blacklisted term are withheld from
+`outlook_list_folders` and skipped by `outlook_search_recent` (results are
+labelled with their folder path, so a marked folder name never appears in
+output).
 
 Everything else is configured by editing the `USER CONFIGURATION` block at
 the top of `ms-outlook.py` directly (there are no extra CLI flags/env vars
@@ -214,7 +224,8 @@ mcpServers:
 | CLI flag | Purpose |
 |---|---|
 | `--check` | Run an offline open/edit/save/reopen self-test and exit (no server) |
-| `--author` | Author name stamped on Word tracked changes (default: the `TRACKED_CHANGE_AUTHOR` config value in the file). Can also be overridden per-call via the `author` argument on the editing tools (`msword_replace_text`, `msword_set_paragraph_text`, `msword_insert_paragraph`, `msword_delete_paragraph`) |
+| `--author` | Author name stamped on Word tracked changes. Falls back to the `MSWORD_AUTHOR` env var, then the `TRACKED_CHANGE_AUTHOR` config value in the file. Can also be overridden per-call via the `author` argument on the editing tools (`msword_replace_text`, `msword_set_paragraph_text`, `msword_insert_paragraph`, `msword_delete_paragraph`) |
+| `--document-root` | Path sandbox: refuse to open or save any file outside this directory tree. Falls back to the `MSWORD_DOCUMENT_ROOT` env var, then the `DOCUMENT_ROOT` config value. **Strongly recommended** — this is the only write-capable server in the suite, and the model chooses the open/save paths, so without a root it can read/write any `.docx` the Windows account can |
 
 Tracked changes are recorded the way Word itself records them: replacements
 are diffed **word-by-word** (only the words that actually change are marked
@@ -233,6 +244,8 @@ mcpServers:
       - C:\path\to\ms-word.py
       - --author
       - Matt
+      - --document-root
+      - C:\Users\me\Documents\ai_docs
     env:
       PYTHONUTF8: "1"
 ```
@@ -241,9 +254,9 @@ mcpServers:
 
 | CLI flag | Purpose |
 |---|---|
-| `--input-dir` | **Required.** Folder containing the source PDFs |
-| `--output-dir` | **Required.** Folder to write `.md` files into |
-| `--recursive` | Also search sub-folders of `--input-dir` (sub-folder structure is mirrored in the output) |
+| `--input-dir` | **Required.** Folder containing the source PDFs. Falls back to the `PDF2MD_INPUT_DIR` env var |
+| `--output-dir` | **Required.** Folder to write `.md` files into. Falls back to the `PDF2MD_OUTPUT_DIR` env var |
+| `--recursive` | Also search sub-folders of `--input-dir` (sub-folder structure is mirrored in the output). Also via `PDF2MD_RECURSIVE=1` |
 
 ```yaml
 mcpServers:

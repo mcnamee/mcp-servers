@@ -158,13 +158,20 @@ failed transfer" rule):
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
 # =============================================================================
 SERVER_NAME = "msword-py"          # advertised to the MCP client
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 
 # Optional path sandbox. If set to a directory string, the server will refuse
 # to open or save any file outside that directory tree (belt-and-braces for a
 # compliance-sensitive environment). Leave as None to allow any path.
 #   e.g. DOCUMENT_ROOT = r"C:\Users\you\Documents\ai_docs"
+# Can also be set at launch with --document-root or the MSWORD_DOCUMENT_ROOT
+# environment variable (which take priority over this constant).
+# STRONGLY RECOMMENDED to set one of the three: the model chooses open/save
+# paths, so without a root it can read/write any .docx this account can.
+# Related caution: only open .docx files from trusted sources - a maliciously
+# crafted file could use XML entity tricks to pull local file contents into
+# the document text that the model then reads.
 DOCUMENT_ROOT = None
 
 MAX_SESSIONS = 32                    # guard against runaway open() calls
@@ -2286,15 +2293,27 @@ def main():
         help="Run an offline open/edit/save/reopen self-test and exit."
     )
     parser.add_argument(
-        "--author", default=None, metavar="NAME",
-        help="Author name stamped on tracked changes "
-             "(default: the TRACKED_CHANGE_AUTHOR config value)."
+        "--author", default=os.environ.get("MSWORD_AUTHOR"), metavar="NAME",
+        help="Author name stamped on tracked changes (falls back to the "
+             "MSWORD_AUTHOR environment variable, then the "
+             "TRACKED_CHANGE_AUTHOR config value)."
+    )
+    parser.add_argument(
+        "--document-root", default=os.environ.get("MSWORD_DOCUMENT_ROOT"),
+        metavar="DIR",
+        help="Path sandbox: refuse to open or save any file outside this "
+             "directory tree (falls back to the MSWORD_DOCUMENT_ROOT "
+             "environment variable, then the DOCUMENT_ROOT config value). "
+             "Strongly recommended: the model chooses open/save paths, so "
+             "without a root it can write any .docx path this account can."
     )
     args = parser.parse_args()
 
-    global AUTHOR
+    global AUTHOR, DOCUMENT_ROOT
     if args.author:
         AUTHOR = args.author
+    if args.document_root:
+        DOCUMENT_ROOT = args.document_root
 
     if args.check:
         sys.exit(run_check())
