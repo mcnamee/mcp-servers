@@ -173,7 +173,7 @@ if IMPORT_ERROR is None:
 # Configuration constants
 # --------------------------------------------------------------------------
 SERVER_NAME = "pdf2md-mcp"
-SERVER_VERSION = "3.1.0"
+SERVER_VERSION = "3.2.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
 # Table detection strategy passed to pymupdf4llm. "lines_strict" is the
@@ -331,10 +331,27 @@ def convert_one(pdf_path):
 # Filesystem helpers
 # --------------------------------------------------------------------------
 def find_pdfs(folder, recursive):
-    """Sorted list of PDF Paths in folder (case-insensitive on suffix)."""
+    """
+    Sorted list of PDF Paths in folder (case-insensitive on suffix).
+    Files that RESOLVE outside the input folder (e.g. a symlink pointing
+    elsewhere) are excluded, so a link dropped into the folder cannot make the
+    server read PDFs beyond it. This also keeps md_output_path's relative_to()
+    mapping safe.
+    """
     base = Path(folder)
+    base_real = base.resolve()
     iterator = base.rglob("*") if recursive else base.iterdir()
-    return sorted(f for f in iterator if f.is_file() and f.suffix.lower() == ".pdf")
+    out = []
+    for f in iterator:
+        if not (f.is_file() and f.suffix.lower() == ".pdf"):
+            continue
+        try:
+            f.resolve().relative_to(base_real)
+        except ValueError:
+            log("Excluded (resolves outside the input folder): {}".format(f))
+            continue
+        out.append(f)
+    return sorted(out)
 
 
 def md_output_path(pdf_path, input_dir, output_dir):

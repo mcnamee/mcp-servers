@@ -41,9 +41,12 @@ REQUIREMENTS
     * Python 3.8+ (standard library only). No pip install required.
 
 CONFIGURATION
-    Edit the CONFIG block directly below the imports. At minimum set
-    WORKBOOK_FOLDER to the directory that holds your .xlsx files. All settings
-    can also be overridden per-run via command-line flags (see --help).
+    Edit the CONFIG block directly below the imports. The workbook folder is
+    REQUIRED - set WORKBOOK_FOLDER there, or supply --folder / the
+    EXCEL_WORKBOOK_FOLDER environment variable at launch; the server refuses
+    to start without one and only ever reads files inside it (symlinks that
+    resolve outside the folder are excluded). Other settings can also be
+    overridden per-run via command-line flags (see --help).
 
 STANDALONE TESTING (before wiring into Continue)
     1) Environment / config sanity check (prints interpreter + folder state):
@@ -107,8 +110,13 @@ from datetime import datetime, timedelta
 # CONFIG  -- edit these values, or override with command-line flags.
 # ===========================================================================
 
-# Folder containing the .xlsx workbooks the model is allowed to read.
-WORKBOOK_FOLDER = r"C:\Users\me\Documents\workbooks"
+# REQUIRED: folder containing the .xlsx workbooks the model is allowed to
+# read. The server only ever reads files inside this folder (symlinks that
+# resolve outside it are excluded) and REFUSES TO START without one. Set it
+# here, or at launch with --folder or the EXCEL_WORKBOOK_FOLDER environment
+# variable (which take priority over this constant).
+#   e.g. WORKBOOK_FOLDER = r"C:\Users\me\Documents\workbooks"
+WORKBOOK_FOLDER = None
 
 # File extensions treated as readable workbooks (lower-case, incl. dot).
 ALLOWED_EXTENSIONS = (".xlsx", ".xlsm")
@@ -121,7 +129,7 @@ MAX_CELL_TEXT_LEN = 500      # long cell text is truncated to this many chars
 
 # Server identity reported to the client.
 SERVER_NAME = "excel-readonly"
-SERVER_VERSION = "1.0.1"
+SERVER_VERSION = "1.1.0"
 PROTOCOL_VERSION = "2024-11-05"
 
 # ===========================================================================
@@ -569,16 +577,36 @@ class Workbook:
 # ===========================================================================
 
 def list_workbook_files(folder):
-    """Return sorted list of readable workbook file names in the folder."""
+    """
+    Return sorted list of readable workbook file names in the folder.
+    Files that RESOLVE outside the folder (e.g. a symlink pointing elsewhere)
+    are excluded, so a link dropped into the folder cannot expose workbooks
+    beyond it.
+    """
+    if not folder:
+        raise WorkbookError(
+            "No workbook folder configured. Pass --folder, set the "
+            "EXCEL_WORKBOOK_FOLDER environment variable, or set "
+            "WORKBOOK_FOLDER in this file."
+        )
     if not os.path.isdir(folder):
         raise WorkbookError("Workbook folder does not exist: %s" % folder)
+    real_base = os.path.realpath(folder)
     out = []
     for name in os.listdir(folder):
         if name.startswith("~$"):          # Excel lock/temp files
             continue
         ext = os.path.splitext(name)[1].lower()
-        if ext in ALLOWED_EXTENSIONS and os.path.isfile(
-                os.path.join(folder, name)):
+        full = os.path.join(folder, name)
+        if ext in ALLOWED_EXTENSIONS and os.path.isfile(full):
+            try:
+                real = os.path.realpath(full)
+                contained = os.path.commonpath([real, real_base]) == real_base
+            except ValueError:  # different drives on Windows
+                contained = False
+            if not contained:
+                log("excluded (resolves outside the workbook folder): %s" % full)
+                continue
             out.append(name)
     return sorted(out)
 
@@ -1181,9 +1209,9 @@ def main(argv=None):
         print("excel_mcp environment check")
         print("  python executable : %s" % sys.executable)
         print("  python version    : %s" % sys.version.split()[0])
-        print("  workbook folder   : %s" % folder)
-        print("  folder exists     : %s" % os.path.isdir(folder))
-        if os.path.isdir(folder):
+        print("  workbook folder   : %s" % (folder or "(NOT SET - required)"))
+        print("  folder exists     : %s" % (bool(folder) and os.path.isdir(folder)))
+        if folder and os.path.isdir(folder):
             try:
                 files = list_workbook_files(folder)
                 print("  workbooks found   : %d" % len(files))
@@ -1194,6 +1222,18 @@ def main(argv=None):
         print("  tools registered  : %d (%s)"
               % (len(TOOLS), ", ".join(TOOLS.keys())))
         return 0
+
+    # The workbook folder is REQUIRED: the server only reads inside it and
+    # must not start unconfined.
+    if not folder:
+        log("FATAL: no workbook folder configured. Pass --folder, set the "
+            "EXCEL_WORKBOOK_FOLDER environment variable, or set "
+            "WORKBOOK_FOLDER in this file.")
+        return 2
+    if not os.path.isdir(folder):
+        log("FATAL: the configured workbook folder does not exist or is not "
+            "a directory: %s" % folder)
+        return 2
 
     if args.list:
         try:

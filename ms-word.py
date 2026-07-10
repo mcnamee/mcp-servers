@@ -123,11 +123,16 @@ WHAT IT CANNOT DO
               - C:\path\to\msword_mcp.py
               - --author
               - Matt
+              - --document-root
+              - C:\Users\me\Documents\ai_docs
             env:
               PYTHONUTF8: "1"
 
     The --author value is stamped on every tracked change. Omit the two --author
     lines to fall back to the TRACKED_CHANGE_AUTHOR config constant below.
+    The --document-root folder is REQUIRED (here, via MSWORD_DOCUMENT_ROOT, or
+    via the DOCUMENT_ROOT constant): all open/save paths must be inside it and
+    the server refuses to start without one.
 
     (If your Continue build uses the older command/args-in-one style, match
     whatever your existing working Python MCP servers use - the launch shape
@@ -158,17 +163,17 @@ failed transfer" rule):
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
 # =============================================================================
 SERVER_NAME = "msword-py"          # advertised to the MCP client
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 
-# Optional path sandbox. If set to a directory string, the server will refuse
-# to open or save any file outside that directory tree (belt-and-braces for a
-# compliance-sensitive environment). Leave as None to allow any path.
+# REQUIRED path sandbox. The server refuses to open or save any file outside
+# this directory tree, and REFUSES TO START if no root is configured - the
+# model chooses open/save paths, so an unconfined server could read/write any
+# .docx this account can. Set it here, or at launch with --document-root or
+# the MSWORD_DOCUMENT_ROOT environment variable (which take priority over
+# this constant). Symlinks are resolved before the containment check.
 #   e.g. DOCUMENT_ROOT = r"C:\Users\you\Documents\ai_docs"
-# Can also be set at launch with --document-root or the MSWORD_DOCUMENT_ROOT
-# environment variable (which take priority over this constant).
-# STRONGLY RECOMMENDED to set one of the three: the model chooses open/save
-# paths, so without a root it can read/write any .docx this account can.
+# (--check is exempt: the self-test sandboxes itself to its own temp folder.)
 # Related caution: only open .docx files from trusted sources - a maliciously
 # crafted file could use XML entity tricks to pull local file contents into
 # the document text that the model then reads.
@@ -283,21 +288,27 @@ def _require(args, key):
 
 
 def _resolve_path(path):
-    """Expand + absolutise a path, and enforce DOCUMENT_ROOT if configured."""
+    """
+    Expand + absolutise a path and enforce the DOCUMENT_ROOT sandbox.
+    realpath (not just abspath) so a symlink inside the root cannot point the
+    server at a file outside it.
+    """
     if not isinstance(path, str) or not path.strip():
         raise ToolError("Path must be a non-empty string")
-    rp = os.path.abspath(os.path.expanduser(path))
-    if DOCUMENT_ROOT:
-        root = os.path.abspath(os.path.expanduser(DOCUMENT_ROOT))
-        try:
-            common = os.path.commonpath([root, rp])
-        except ValueError:
-            # Different drives on Windows raise ValueError from commonpath.
-            common = None
-        if common != root:
-            raise ToolError(
-                "Path is outside the permitted DOCUMENT_ROOT and was refused."
-            )
+    rp = os.path.realpath(os.path.expanduser(path))
+    if not DOCUMENT_ROOT:
+        # main() refuses to start without a root; this guards direct callers.
+        raise ToolError("No DOCUMENT_ROOT is configured; file access is disabled.")
+    root = os.path.realpath(os.path.expanduser(DOCUMENT_ROOT))
+    try:
+        common = os.path.commonpath([root, rp])
+    except ValueError:
+        # Different drives on Windows raise ValueError from commonpath.
+        common = None
+    if common != root:
+        raise ToolError(
+            "Path is outside the permitted DOCUMENT_ROOT and was refused."
+        )
     return rp
 
 
@@ -1938,12 +1949,17 @@ def serve():
 # =============================================================================
 def run_check():
     import tempfile
+    global DOCUMENT_ROOT
     docx_ver, lxml_ver = _versions()
     print("[check] interpreter : {}".format(sys.executable))
     print("[check] python-docx : {}".format(docx_ver))
     print("[check] lxml        : {}".format(lxml_ver))
 
     tmpdir = tempfile.mkdtemp(prefix="msword_check_")
+    # The self-test sandboxes itself to its own temp folder so it can run
+    # before the endpoint's real DOCUMENT_ROOT exists.
+    DOCUMENT_ROOT = tmpdir
+    print("[check] sandbox     : {} (self-test only)".format(tmpdir))
     path = os.path.join(tmpdir, "roundtrip.docx")
     ok = True
     try:
@@ -2301,11 +2317,12 @@ def main():
     parser.add_argument(
         "--document-root", default=os.environ.get("MSWORD_DOCUMENT_ROOT"),
         metavar="DIR",
-        help="Path sandbox: refuse to open or save any file outside this "
-             "directory tree (falls back to the MSWORD_DOCUMENT_ROOT "
-             "environment variable, then the DOCUMENT_ROOT config value). "
-             "Strongly recommended: the model chooses open/save paths, so "
-             "without a root it can write any .docx path this account can."
+        help="REQUIRED path sandbox (unless the DOCUMENT_ROOT config constant "
+             "is set, or via the MSWORD_DOCUMENT_ROOT environment variable): "
+             "the server refuses to open or save any file outside this "
+             "directory tree, and refuses to start without one. The model "
+             "chooses open/save paths, so an unconfined server could "
+             "read/write any .docx this account can."
     )
     args = parser.parse_args()
 
@@ -2317,6 +2334,18 @@ def main():
 
     if args.check:
         sys.exit(run_check())
+
+    # File access is confined to DOCUMENT_ROOT, so a root is mandatory.
+    if not DOCUMENT_ROOT:
+        log("FATAL: no document root configured. Pass --document-root, set the "
+            "MSWORD_DOCUMENT_ROOT environment variable, or set the "
+            "DOCUMENT_ROOT constant in this file. The server only opens/saves "
+            ".docx files inside that folder and will not start without one.")
+        sys.exit(2)
+    if not os.path.isdir(DOCUMENT_ROOT):
+        log("FATAL: the configured document root does not exist or is not a "
+            "directory: {}".format(DOCUMENT_ROOT))
+        sys.exit(2)
 
     try:
         serve()

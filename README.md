@@ -26,6 +26,26 @@ pip install python-docx pymupdf pymupdf4llm pywin32
 
 (Drop `pywin32` if you're not on Windows / not using `ms-outlook.py`.)
 
+## File access policy
+
+Every server that touches the filesystem is confined to the folder(s) named
+in its configuration, and that configuration is **required** — a server will
+refuse to start unconfined rather than fall back to "anywhere":
+
+| Server | Confined to | Required setting |
+|---|---|---|
+| `ms-word.py` | open/save only inside the document root | `--document-root` / `MSWORD_DOCUMENT_ROOT` / `DOCUMENT_ROOT` constant |
+| `ms-excel.py` | reads only inside the workbook folder | `--folder` / `EXCEL_WORKBOOK_FOLDER` / `WORKBOOK_FOLDER` constant |
+| `knowledge-base.py` | reads only inside the docs folder | `--docs-dir` / `REFERENCE_DOCS_DIR` |
+| `knowledge-base-semantic.py` | reads only inside the docs folder | `--docs-dir` / `KB_DOCS_DIR` |
+| `pdf-to-md.py` | reads only the input folder, writes only the output folder | `--input-dir` + `--output-dir` (or `PDF2MD_INPUT_DIR`/`PDF2MD_OUTPUT_DIR`) |
+| `confluence.py` | no local file access unless `CONFLUENCE_KB_DIR` is set; then writes only inside that folder | n/a (mirroring is optional; unset = no file access) |
+| `ms-outlook.py` | no file access (local COM only; reads the optional `--blacklist-file` once at startup) | n/a |
+
+In all cases paths are resolved (symlinks included) before the containment
+check, so a symlink dropped inside a configured folder cannot reach files
+outside it.
+
 ## Notes
 
 - `ms-word.py` and `pdf-to-md.py` log `sys.executable` on startup, so if a
@@ -158,7 +178,7 @@ mcpServers:
 
 | CLI flag | Purpose |
 |---|---|
-| `--folder` | Folder of `.xlsx`/`.xlsm` workbooks to expose. Falls back to the `EXCEL_WORKBOOK_FOLDER` env var, then the CONFIG block default in the file |
+| `--folder` | **Required.** Folder of `.xlsx`/`.xlsm` workbooks to expose — the server only reads files inside it and refuses to start without one. Falls back to the `EXCEL_WORKBOOK_FOLDER` env var, then the `WORKBOOK_FOLDER` constant in the file |
 | `--check` | Print environment/config diagnostics and exit (no server) |
 | `--list` | List readable workbooks in the folder and exit (no server) |
 
@@ -225,7 +245,7 @@ mcpServers:
 |---|---|
 | `--check` | Run an offline open/edit/save/reopen self-test and exit (no server) |
 | `--author` | Author name stamped on Word tracked changes. Falls back to the `MSWORD_AUTHOR` env var, then the `TRACKED_CHANGE_AUTHOR` config value in the file. Can also be overridden per-call via the `author` argument on the editing tools (`msword_replace_text`, `msword_set_paragraph_text`, `msword_insert_paragraph`, `msword_delete_paragraph`) |
-| `--document-root` | Path sandbox: refuse to open or save any file outside this directory tree. Falls back to the `MSWORD_DOCUMENT_ROOT` env var, then the `DOCUMENT_ROOT` config value. **Strongly recommended** — this is the only write-capable server in the suite, and the model chooses the open/save paths, so without a root it can read/write any `.docx` the Windows account can |
+| `--document-root` | **Required.** Path sandbox: every open/save must be inside this directory tree, and the server refuses to start without one (`--check` is exempt — the self-test sandboxes itself to its own temp folder). Falls back to the `MSWORD_DOCUMENT_ROOT` env var, then the `DOCUMENT_ROOT` config value. This is the only write-capable server in the suite, and the model chooses the open/save paths |
 
 Tracked changes are recorded the way Word itself records them: replacements
 are diffed **word-by-word** (only the words that actually change are marked
