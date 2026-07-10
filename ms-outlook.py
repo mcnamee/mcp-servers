@@ -47,6 +47,14 @@ just below this docstring. Edit them there; nothing else needs changing.
                      shown (no subject/sender of a blocked item is ever revealed).
    - get_email     : a blocked message returns a generic refusal, not content.
    - calendar      : blocked events are omitted; a withheld count is shown.
+   - folders       : folder NAMES matching the blacklist are withheld from
+                     outlook_list_folders and skipped by outlook_search_recent
+                     (results are labelled with their folder path, so a marked
+                     folder name must never appear in output).
+   - FAIL CLOSED (optional): set REQUIRE_BLACKLIST = True below, pass
+                     --require-blacklist, or set OUTLOOK_REQUIRE_BLACKLIST=1 to
+                     make the server refuse to start if the blacklist is empty,
+                     so a missing terms file cannot silently disable filtering.
    - The matched term is NEVER shown to the AI (that would leak the marking); it
      is logged to STDERR only, for local audit.
    - FAIL-SAFE: if an item's subject or body cannot be read (so it cannot be
@@ -90,8 +98,9 @@ just below this docstring. Edit them there; nothing else needs changing.
 EXTERNAL BLACKLIST FILE (optional)
 ----------------------------------
 Instead of (or in addition to) editing BLACKLIST_TERMS, supply extra terms in a
-file via --blacklist-file. One term per line; '#' starts a comment. File terms
-are ADDED to the built-in list (they never reduce it). Example file contents:
+file via --blacklist-file (or the OUTLOOK_BLACKLIST_FILE environment variable).
+One term per line; '#' starts a comment. File terms are ADDED to the built-in
+list (they never reduce it). Example file contents:
 
     # outlook-blacklist.txt  - classification terms to withhold from the AI
     PROTECTED
@@ -153,6 +162,14 @@ BLACKLIST_TERMS = [
 
 # --- 2. How blacklist terms are matched: "word" (default) or "substring".
 BLACKLIST_MATCH_MODE = "word"
+
+# --- 2b. Fail closed if the blacklist ends up empty. When True (or when the
+#         --require-blacklist flag / OUTLOOK_REQUIRE_BLACKLIST=1 env var is
+#         set), the server REFUSES TO START unless at least one blacklist term
+#         is active. Turn this on when the compliance filter is mandatory in
+#         your environment, so a missing/empty terms file cannot silently
+#         disable filtering.
+REQUIRE_BLACKLIST = False
 
 # --- 3. Calendar date filter format (LOCALE-SENSITIVE). If outlook_get_calendar
 #        returns nothing on an AU-locale machine, switch to one of the alternatives.
@@ -495,11 +512,20 @@ def all_mail_folders():
 
 
 def find_target_folders(names_lower):
-    """Return (label, folder) for folders whose LEAF name matches names_lower."""
+    """
+    Return (label, folder) for folders whose LEAF name matches names_lower.
+    Folders whose path matches the content blacklist are skipped entirely:
+    results are labelled with their folder path, so a blacklisted folder name
+    must never appear in output.
+    """
     matched = []
     for path, folder in all_mail_folders():
         leaf = path.rsplit("/", 1)[-1].lower()
         if leaf in names_lower:
+            reason = blacklisted_match(path)
+            if reason:
+                log("Skipped a search folder (blacklist match: {0}).".format(reason))
+                continue
             matched.append((path, folder))
     return matched
 
@@ -785,16 +811,27 @@ def tool_list_folders(args):
     if not folders:
         return "No folders found (could not enumerate Outlook stores)."
     lines = []
+    withheld = 0
     for path, folder in folders:
         if len(lines) >= max_lines:
             lines.append("... (list truncated; raise max_results to see more)")
             break
+        # The content blacklist applies to folder NAMES too - a folder named
+        # after a protective marking must not be revealed to the AI.
+        reason = blacklisted_match(path)
+        if reason:
+            withheld += 1
+            log("Withheld a folder name (blacklist match: {0}).".format(reason))
+            continue
         try:
             count = folder.Items.Count
         except Exception:
             count = "?"
         lines.append("- {0}  (items: {1})".format(path, count))
-    return "Outlook folders (store/path, with item counts):\n" + "\n".join(lines)
+    note = ""
+    if withheld:
+        note = "\n\n[{0} folder(s) withheld by the content blacklist.]".format(withheld)
+    return "Outlook folders (store/path, with item counts):\n" + "\n".join(lines) + note
 
 
 def tool_search_recent(args):
@@ -1185,7 +1222,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "outlook-mcp", "version": "1.3.0"}
+SERVER_INFO = {"name": "outlook-mcp", "version": "1.4.0"}
 
 
 def rpc_result(req_id, result):
@@ -1314,14 +1351,28 @@ def main():
     )
     parser.add_argument(
         "--blacklist-file",
+        default=os.environ.get("OUTLOOK_BLACKLIST_FILE"),
         help="Path to a file of EXTRA blacklist terms (one per line; '#' for comments). "
-             "Terms are added to the built-in list.",
+             "Terms are added to the built-in list. Falls back to the "
+             "OUTLOOK_BLACKLIST_FILE environment variable.",
     )
     parser.add_argument(
         "--search-folders",
+        default=os.environ.get("OUTLOOK_SEARCH_FOLDERS"),
         help="Comma-separated folder NAMES used as the DEFAULT set for "
              "outlook_search_recent, overriding SEARCH_ALL_FOLDERS. Example: "
-             "\"Inbox,Sent Items,Archive\". A per-call 'folders' argument still wins.",
+             "\"Inbox,Sent Items,Archive\". A per-call 'folders' argument still wins. "
+             "Falls back to the OUTLOOK_SEARCH_FOLDERS environment variable.",
+    )
+    parser.add_argument(
+        "--require-blacklist",
+        action="store_true",
+        default=(os.environ.get("OUTLOOK_REQUIRE_BLACKLIST", "").strip().lower()
+                 in ("1", "true", "yes", "on")),
+        help="Fail closed: refuse to start unless the content blacklist has at "
+             "least one active term (also via OUTLOOK_REQUIRE_BLACKLIST=1 or the "
+             "REQUIRE_BLACKLIST config constant). Use when the compliance filter "
+             "is mandatory, so a missing terms file cannot silently disable it.",
     )
     parser.add_argument(
         "--version",
@@ -1342,6 +1393,14 @@ def main():
             log("FATAL: could not read --blacklist-file: {0}".format(exc))
             sys.exit(2)
     build_blacklist(extra_terms)
+
+    # Fail closed when the blacklist is mandatory but empty.
+    if (args.require_blacklist or REQUIRE_BLACKLIST) and _BLACKLIST_RE is None:
+        log("FATAL: --require-blacklist is set but the content blacklist is "
+            "EMPTY. Add terms to BLACKLIST_TERMS or supply --blacklist-file "
+            "(or OUTLOOK_BLACKLIST_FILE). Refusing to start without the "
+            "compliance filter.")
+        sys.exit(2)
 
     # Optional launch-time override of the default outlook_search_recent folders.
     if args.search_folders:

@@ -159,12 +159,22 @@ HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 # ---------------------------------------------------------------------------
 
 def list_documents():
-    """Return a sorted list of absolute paths to all knowledge-base documents."""
+    """
+    Return a sorted list of absolute paths to all knowledge-base documents.
+    Anything that RESOLVES outside the configured folder is excluded (e.g. a
+    file symlink pointing elsewhere), so a link dropped into the folder cannot
+    expose files beyond it. os.walk already declines to follow directory
+    symlinks (followlinks=False is its default).
+    """
     found = []
     for root, _dirs, files in os.walk(DOCS_DIR):
         for filename in files:
             if os.path.splitext(filename)[1].lower() in DOC_EXTENSIONS:
-                found.append(os.path.join(root, filename))
+                full = os.path.join(root, filename)
+                if not is_within(full, DOCS_DIR):
+                    log("Excluded (resolves outside the docs folder): {0}".format(full))
+                    continue
+                found.append(full)
     found.sort()
     return found
 
@@ -718,7 +728,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "knowledge-base-semantic", "version": "1.0.0"}
+SERVER_INFO = {"name": "knowledge-base-semantic", "version": "1.0.1"}
 
 # Sent in the initialize response so a capable client can prime the model on how
 # to use these tools for meaning-based retrieval.

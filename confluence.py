@@ -15,7 +15,10 @@ Tools exposed (read-only / query):
   - confluence_get_page_by_title: fetch one page by exact title + space key
 
 Configuration is read from environment variables (the natural fit for
-Continue's `env:` block) and can be overridden by command-line arguments:
+Continue's `env:` block); non-secret settings can be overridden by
+command-line arguments. CREDENTIALS ARE ENV-VAR ONLY - there are no
+--token/--user/--password flags, because command-line arguments are visible
+to other local users in process listings:
 
   CONFLUENCE_BASE_URL   e.g. https://confluence.internal.example.com
                         (include any context path, no trailing slash)
@@ -52,7 +55,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "confluence-mcp"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 # Protocol version we default to if the client does not send one. We echo the
 # client's requested version when possible (see handle_initialize) so that we
 # stay compatible with whatever the host negotiated.
@@ -623,8 +626,14 @@ class ConfluenceClient:
         parent_id = str(parent_id).strip()
         if not parent_id:
             raise ConfluenceError("A parent page could not be identified")
+        if not parent_id.isdigit():
+            # Enforced so the unquoted embed below cannot inject CQL.
+            raise ConfluenceError(
+                "'parent_id' must be a numeric content ID (got {!r}). Use "
+                "'parent_title' plus 'space' if you only know the title.".format(parent_id)
+            )
         field = "parent" if direct_only else "ancestor"
-        # parent_id is a numeric content ID, so it is safe to embed unquoted.
+        # parent_id is validated as numeric above, so it is safe to embed unquoted.
         clauses = ["{} = {}".format(field, parent_id), "type = page"]
         if modified_within_days is not None:
             try:
@@ -1005,13 +1014,10 @@ def build_arg_parser():
     p.add_argument("--base-url", default=os.environ.get("CONFLUENCE_BASE_URL"),
                    help="Confluence base URL incl. any context path, no trailing slash "
                         "(env CONFLUENCE_BASE_URL).")
-    p.add_argument("--token", default=os.environ.get("CONFLUENCE_TOKEN"),
-                   help="Personal Access Token, sent as a Bearer token "
-                        "(env CONFLUENCE_TOKEN). Preferred over basic auth.")
-    p.add_argument("--user", default=os.environ.get("CONFLUENCE_USER"),
-                   help="Username for basic auth (env CONFLUENCE_USER).")
-    p.add_argument("--password", default=os.environ.get("CONFLUENCE_PASSWORD"),
-                   help="Password for basic auth (env CONFLUENCE_PASSWORD).")
+    # SECURITY: credentials are deliberately env-var ONLY (CONFLUENCE_TOKEN, or
+    # CONFLUENCE_USER + CONFLUENCE_PASSWORD). Command-line arguments are visible
+    # to other local users in process listings, so no --token/--user/--password
+    # flags are offered.
     p.add_argument("--ca-cert", default=os.environ.get("CONFLUENCE_CA_CERT"),
                    help="Path to a PEM CA bundle for an internal CA "
                         "(env CONFLUENCE_CA_CERT).")
@@ -1050,20 +1056,25 @@ def main(argv=None):
 
     args = build_arg_parser().parse_args(argv)
 
+    # Credentials come from the environment ONLY (never argv - see build_arg_parser).
+    token = os.environ.get("CONFLUENCE_TOKEN")
+    user = os.environ.get("CONFLUENCE_USER")
+    password = os.environ.get("CONFLUENCE_PASSWORD")
+
     if not args.base_url:
         log("FATAL: no base URL. Set CONFLUENCE_BASE_URL or pass --base-url.")
         return 2
-    if not args.token and not (args.user and args.password):
-        log("FATAL: no credentials. Set CONFLUENCE_TOKEN, or CONFLUENCE_USER "
-            "and CONFLUENCE_PASSWORD.")
+    if not token and not (user and password):
+        log("FATAL: no credentials. Set the CONFLUENCE_TOKEN environment "
+            "variable, or CONFLUENCE_USER and CONFLUENCE_PASSWORD.")
         return 2
 
     try:
         client = ConfluenceClient(
             base_url=args.base_url,
-            token=args.token,
-            user=args.user,
-            password=args.password,
+            token=token,
+            user=user,
+            password=password,
             verify_ssl=not args.insecure,
             ca_cert=args.ca_cert,
             timeout=args.timeout,

@@ -125,12 +125,22 @@ DOCS_DIR = None
 # ---------------------------------------------------------------------------
 
 def list_documents():
-    """Return a sorted list of absolute paths to all reference documents."""
+    """
+    Return a sorted list of absolute paths to all reference documents.
+    Anything that RESOLVES outside the configured folder is excluded (e.g. a
+    file symlink pointing elsewhere), so a link dropped into the folder cannot
+    expose files beyond it. os.walk already declines to follow directory
+    symlinks (followlinks=False is its default).
+    """
     found = []
     for root, _dirs, files in os.walk(DOCS_DIR):
         for filename in files:
             if os.path.splitext(filename)[1].lower() in DOC_EXTENSIONS:
-                found.append(os.path.join(root, filename))
+                full = os.path.join(root, filename)
+                if not is_within(full, DOCS_DIR):
+                    log("Excluded (resolves outside the docs folder): {0}".format(full))
+                    continue
+                found.append(full)
     found.sort()
     return found
 
@@ -459,7 +469,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "reference-mcp", "version": "1.0.0"}
+SERVER_INFO = {"name": "reference-mcp", "version": "1.0.1"}
 
 
 def rpc_result(req_id, result):
