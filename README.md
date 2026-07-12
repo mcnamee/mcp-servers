@@ -11,6 +11,7 @@ launch the server with.
 | Server | pip install | Notes |
 |---|---|---|
 | `confluence.py` | _none_ | standard library only |
+| `jira.py` | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
 | `knowledge-base.py` | _none_ | standard library only (keyword search) |
 | `knowledge-base-semantic.py` | _none_ | standard library only; meaning-based retrieval driven by your connected model (no local embedding model, no network) |
 | `ms-excel.py` | _none_ | standard library only (parses .xlsx as a zip of XML) |
@@ -40,6 +41,7 @@ refuse to start unconfined rather than fall back to "anywhere":
 | `knowledge-base-semantic.py` | reads only inside the docs folder | `--docs-dir` / `KB_DOCS_DIR` |
 | `pdf-to-md.py` | reads only the input folder, writes only the output folder | `--input-dir` + `--output-dir` (or `PDF2MD_INPUT_DIR`/`PDF2MD_OUTPUT_DIR`) |
 | `confluence.py` | no local file access unless `CONFLUENCE_KB_DIR` is set; then writes only inside that folder | n/a (mirroring is optional; unset = no file access) |
+| `jira.py` | no local file access (HTTP GET to Jira only; reads the optional `JIRA_CA_CERT` bundle once at startup) | n/a |
 | `ms-outlook.py` | no file access (local COM only; reads the optional `--blacklist-file` once at startup) | n/a |
 
 In all cases paths are resolved (symlinks included) before the containment
@@ -104,6 +106,42 @@ mcpServers:
       CONFLUENCE_TOKEN: your-personal-access-token
       PYTHONUTF8: "1"
 ```
+
+### jira.py
+
+Read-only access to Jira Data Center (v2 REST API). Every request is an HTTP
+GET — there is no code path that creates, edits, transitions, comments on, or
+deletes anything. Like `confluence.py`, **credentials are env-var only** (no
+`--token`/`--user`/`--password` flags).
+
+| Env var | CLI flag | Purpose |
+|---|---|---|
+| `JIRA_BASE_URL` | `--base-url` | Base URL incl. any context path, no trailing slash |
+| `JIRA_TOKEN` | _(env only)_ | Personal Access Token, sent as Bearer (preferred; Jira DC 8.14+) |
+| `JIRA_USER` | _(env only)_ | Username for basic auth (fallback if no token) |
+| `JIRA_PASSWORD` | _(env only)_ | Password for basic auth |
+| `JIRA_PROJECTS` | `--projects` | Optional comma-separated **project-key allowlist** (e.g. `"ABC,DEF"`). When set, every tool is confined to those projects: searches are scoped with an AND clause, issue keys outside the list are refused, and other projects are hidden from `jira_list_projects` |
+| `JIRA_CA_CERT` | `--ca-cert` | Path to a PEM CA bundle for an internal CA |
+| `JIRA_VERIFY_SSL=false` | `--insecure` | Disable TLS certificate verification |
+| `JIRA_TIMEOUT` | `--timeout` | Request timeout in seconds (default 30) |
+| `JIRA_MAX_BODY` | `--max-body` | Truncate issue descriptions to N chars, 0 = unlimited (default) |
+| — | `--check` | Connect to Jira, print who you are authenticated as + visible project count to stderr, then exit (no server) |
+
+```yaml
+mcpServers:
+  - name: jira
+    command: C:\path\to\python.exe
+    args:
+      - C:\path\to\jira.py
+    env:
+      JIRA_BASE_URL: https://jira.internal.example.com
+      JIRA_TOKEN: your-personal-access-token
+      JIRA_PROJECTS: "ABC,DEF"        # optional allowlist
+      PYTHONUTF8: "1"
+```
+
+> Targets Jira **Data Center / Server** (plain-text descriptions via the v2
+> API). Jira Cloud's v3 API returns rich-text documents and is not supported.
 
 ### knowledge-base.py
 
@@ -307,6 +345,16 @@ one or more of the tools the server exposes.
 4. "Open the 'Q3 Roadmap' page in the PROD space and summarise it." → `confluence_get_page_by_title`
 5. "List every page under the 'Engineering Handbook' in the DOCS space, direct children only." → `confluence_list_pages_under`
 6. "Pull the onboarding runbook into our local knowledge base for offline search." → `confluence_get_page` (or `confluence_get_page_by_title`), automatically mirrored to Markdown when `--kb-dir`/`CONFLUENCE_KB_DIR` is configured, so `knowledge-base.py`'s `reference_search`/`reference_get` can find it afterwards
+
+### jira.py
+
+1. "What's assigned to me right now, highest priority first?" → `jira_my_issues`
+2. "Find any tickets mentioning the login timeout bug — has anyone reported this before?" → `jira_search`
+3. "Show me ABC-123 in full, including the comments and who changed its status." → `jira_get_issue` with `include_changelog=true`
+4. "Everything resolved in project ABC in the last week, for the release notes." → `jira_search_jql` with `project = ABC AND resolved >= -7d`
+5. "How healthy is project ABC — what's open, in progress, unassigned?" → `jira_project_status`
+6. "Which projects can I see in Jira?" → `jira_list_projects`
+7. "Draft a status report from my open tickets as a Word doc with tracked changes." → `jira_my_issues` + `ms-word.py`'s editing tools
 
 ### knowledge-base.py
 
