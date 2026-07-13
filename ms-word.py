@@ -9,6 +9,12 @@ with the .docx engine provided by the Python library `python-docx`.
 
 WHAT IT CAN DO
     - Open a .docx into an in-memory session, keyed by session_id.
+    - Create a NEW .docx from scratch (msword_create) in a configurable output
+      folder, then build it up with the add_/insert_ tools and save it.
+    - On open, optionally MIRROR the document to Markdown into a knowledge-base
+      folder for a local RAG index (the same idea as confluence.py's --kb-dir):
+      headings, bullet/numbered lists and tables are converted; files are named
+      'Word - <name>.md' and overwritten each open. Enabled with --kb-dir.
     - Read full content (linear text, or a structured block list).
     - Search text (body paragraphs and table cells).
     - Replace text, correctly handling matches that span multiple runs.
@@ -125,6 +131,10 @@ WHAT IT CANNOT DO
               - Matt
               - --document-root
               - C:\Users\me\Documents\ai_docs
+              - --output-dir
+              - C:\Users\me\Documents\ai_generated
+              - --kb-dir
+              - C:\Users\me\Documents\rag_kb
             env:
               PYTHONUTF8: "1"
 
@@ -133,6 +143,11 @@ WHAT IT CANNOT DO
     The --document-root folder is REQUIRED (here, via MSWORD_DOCUMENT_ROOT, or
     via the DOCUMENT_ROOT constant): all open/save paths must be inside it and
     the server refuses to start without one.
+    The --output-dir folder (optional; MSWORD_OUTPUT_DIR or the OUTPUT_DIR
+    constant) is where msword_create writes NEW documents; it is kept SEPARATE
+    from the knowledge-base folder and defaults to the document root if unset.
+    The --kb-dir folder (optional; MSWORD_KB_DIR or the KB_DIR constant) turns
+    on Markdown mirroring for a local RAG knowledge base; omit it to disable.
 
     (If your Continue build uses the older command/args-in-one style, match
     whatever your existing working Python MCP servers use - the launch shape
@@ -163,7 +178,7 @@ failed transfer" rule):
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
 # =============================================================================
 SERVER_NAME = "msword-py"          # advertised to the MCP client
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 
 # REQUIRED path sandbox. The server refuses to open or save any file outside
@@ -178,6 +193,26 @@ PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 # crafted file could use XML entity tricks to pull local file contents into
 # the document text that the model then reads.
 DOCUMENT_ROOT = None
+
+# OPTIONAL folder where msword_create writes NEW .docx files. Kept SEPARATE from
+# the knowledge-base folder below. Set it here, or at launch with --output-dir
+# or the MSWORD_OUTPUT_DIR environment variable (which take priority over this
+# constant). It is also treated as a permitted open/save location alongside
+# DOCUMENT_ROOT, so freshly created documents can be reopened/edited later. If
+# left unset, msword_create falls back to writing inside DOCUMENT_ROOT.
+#   e.g. OUTPUT_DIR = r"C:\Users\you\Documents\ai_generated"
+OUTPUT_DIR = None
+
+# OPTIONAL knowledge-base (RAG) folder. If set, EVERY document opened with
+# msword_open is ALSO written out as a Markdown file into this folder, the same
+# way confluence.py mirrors pages, so the content can feed a local RAG index.
+# The Markdown files are named 'Word - <name>.md' and overwritten each time.
+# This folder is written to by the server only (the model never chooses the
+# path), so it does not need to sit inside DOCUMENT_ROOT. Set it here, or at
+# launch with --kb-dir or the MSWORD_KB_DIR environment variable (which take
+# priority over this constant). Leave unset to disable mirroring.
+#   e.g. KB_DIR = r"C:\Users\you\Documents\rag_kb"
+KB_DIR = None
 
 MAX_SESSIONS = 32                    # guard against runaway open() calls
 SEARCH_CONTEXT_CHARS = 40            # chars of context either side of a match
@@ -287,29 +322,48 @@ def _require(args, key):
     return args[key]
 
 
+def _permitted_roots():
+    """
+    Folders the server is allowed to open/save inside: the DOCUMENT_ROOT
+    sandbox, plus the OUTPUT_DIR for created documents (when configured and
+    distinct). The knowledge-base folder is deliberately NOT included - the
+    model never supplies a path into it; the server writes there itself.
+    """
+    roots = []
+    if DOCUMENT_ROOT:
+        roots.append(DOCUMENT_ROOT)
+    if OUTPUT_DIR:
+        roots.append(OUTPUT_DIR)
+    return roots
+
+
 def _resolve_path(path):
     """
-    Expand + absolutise a path and enforce the DOCUMENT_ROOT sandbox.
-    realpath (not just abspath) so a symlink inside the root cannot point the
+    Expand + absolutise a path and enforce the write sandbox: the path must sit
+    inside one of the permitted roots (DOCUMENT_ROOT or, if set, OUTPUT_DIR).
+    realpath (not just abspath) so a symlink inside a root cannot point the
     server at a file outside it.
     """
     if not isinstance(path, str) or not path.strip():
         raise ToolError("Path must be a non-empty string")
     rp = os.path.realpath(os.path.expanduser(path))
-    if not DOCUMENT_ROOT:
+    roots = _permitted_roots()
+    if not roots:
         # main() refuses to start without a root; this guards direct callers.
         raise ToolError("No DOCUMENT_ROOT is configured; file access is disabled.")
-    root = os.path.realpath(os.path.expanduser(DOCUMENT_ROOT))
-    try:
-        common = os.path.commonpath([root, rp])
-    except ValueError:
-        # Different drives on Windows raise ValueError from commonpath.
-        common = None
-    if common != root:
-        raise ToolError(
-            "Path is outside the permitted DOCUMENT_ROOT and was refused."
-        )
-    return rp
+    for root in roots:
+        real_root = os.path.realpath(os.path.expanduser(root))
+        try:
+            # Different drives on Windows raise ValueError from commonpath.
+            if os.path.commonpath([real_root, rp]) == real_root:
+                return rp
+        except ValueError:
+            continue
+    raise ToolError(
+        "Path is outside the permitted folder(s) (DOCUMENT_ROOT"
+        + (" / OUTPUT_DIR" if OUTPUT_DIR else "")
+        + ") and was refused."
+    )
 
 
 def _get_session(args):
@@ -999,6 +1053,153 @@ def _render_structured(doc):
 
 
 # =============================================================================
+# MARKDOWN EXPORT  (for the RAG knowledge base)
+#
+# A best-effort .docx -> Markdown converter aimed at RAG ingestion, not a
+# pixel-perfect renderer. It walks blocks in true document order and maps the
+# common structural elements: headings (by paragraph style), bullet/numbered
+# lists (by style), plain paragraphs, and tables (as GitHub-style pipe tables).
+# Text is taken from the FINAL view (pending tracked insertions included,
+# deletions omitted), so a mirrored file matches what msword_get_content shows.
+# =============================================================================
+def safe_filename(name, max_len=150):
+    """
+    Turn a document name into a filesystem-safe filename component (no
+    extension). Strips characters illegal on Windows (< > : " / \\ | ? * and
+    control chars), collapses whitespace, removes trailing dots/spaces (also
+    illegal on Windows), and caps the length. Returns 'untitled' if nothing
+    usable is left.
+    """
+    if not name:
+        return "untitled"
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name)
+    cleaned = " ".join(cleaned.split()).strip(" .")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned or "untitled"
+
+
+def _heading_level(style_name):
+    """
+    Markdown heading depth (1..6) for a paragraph style, or None if the style
+    is not a heading. Word's 'Title' maps to a top-level '#'; 'Heading N' maps
+    to N '#' (capped at 6, Markdown's maximum).
+    """
+    if not style_name:
+        return None
+    name = style_name.strip().lower()
+    if name == "title":
+        return 1
+    m = re.match(r"heading\s+(\d+)$", name)
+    if m:
+        return min(max(int(m.group(1)), 1), 6)
+    return None
+
+
+def _list_prefix(style_name):
+    """Markdown list marker for a Word list-paragraph style, or None."""
+    if not style_name:
+        return None
+    name = style_name.strip().lower()
+    if name.startswith("list bullet"):
+        return "- "
+    if name.startswith("list number"):
+        return "1. "
+    return None
+
+
+def _md_escape_cell(text):
+    """Make cell text safe for a single Markdown table cell (one line)."""
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    # Table cells are single-line; fold any embedded breaks into <br>.
+    return " ".join(part.strip() for part in text.splitlines()).strip()
+
+
+def _table_to_markdown(table):
+    """Render a python-docx Table as a GitHub-style pipe table (final view)."""
+    rows = [[_final_cell_text(cell) for cell in row.cells] for row in table.rows]
+    if not rows:
+        return ""
+    ncols = max(len(r) for r in rows)
+
+    def _fmt(row):
+        padded = row + [""] * (ncols - len(row))
+        return "| " + " | ".join(_md_escape_cell(c) for c in padded) + " |"
+
+    lines = [_fmt(rows[0]), "| " + " | ".join("---" for _ in range(ncols)) + " |"]
+    lines.extend(_fmt(r) for r in rows[1:])
+    return "\n".join(lines)
+
+
+def _render_markdown(doc):
+    """
+    Convert the whole document to Markdown. Blocks are separated by a blank
+    line, except consecutive list items, which stay on adjacent lines so they
+    render as one list.
+    """
+    blocks = []  # list of (kind, rendered_text)
+    for block in _iter_block_items(doc):
+        if isinstance(block, Paragraph):
+            style = block.style.name if block.style is not None else None
+            text = _final_para_text(block._p)
+            level = _heading_level(style)
+            if level is not None:
+                if text.strip():
+                    blocks.append(("heading", "#" * level + " " + text.strip()))
+                continue
+            prefix = _list_prefix(style)
+            if prefix is not None:
+                blocks.append(("list", prefix + text.strip()))
+                continue
+            if text.strip() == "":
+                continue  # drop empty spacer paragraphs
+            blocks.append(("para", text.rstrip()))
+        elif isinstance(block, Table):
+            md = _table_to_markdown(block)
+            if md:
+                blocks.append(("table", md))
+
+    out = []
+    for i, (kind, rendered) in enumerate(blocks):
+        if i > 0:
+            prev_kind = blocks[i - 1][0]
+            # Keep adjacent list items tight; separate everything else.
+            out.append("\n" if kind == "list" and prev_kind == "list" else "\n\n")
+        out.append(rendered)
+    return "".join(out)
+
+
+def _save_to_kb(doc, source_path):
+    """
+    Mirror the open document to '<KB_DIR>/Word - <name>.md', overwriting any
+    existing file, for a local RAG knowledge base. Returns the path written;
+    raises OSError on failure. The <name> is the source file's base name.
+
+    This is a side effect of opening a document; callers must never let a
+    failure here break the open, so failures are logged and swallowed there.
+    """
+    base = os.path.splitext(os.path.basename(source_path))[0]
+    md_body = _render_markdown(doc)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    header = (
+        "# {title}\n\n"
+        "- Source: {src}\n"
+        "- Fetched: {stamp}\n\n"
+        "---\n\n"
+    ).format(title=base, src=source_path, stamp=stamp)
+    content = header + (md_body + "\n" if md_body.strip() else "(no readable body content)\n")
+
+    # Create the folder if needed, then write. newline="\n" keeps endings
+    # consistent and avoids CRLF doubling on Windows.
+    os.makedirs(KB_DIR, exist_ok=True)
+    filename = "Word - " + safe_filename(base) + ".md"
+    path = os.path.join(KB_DIR, filename)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(content)
+    return path
+
+
+# =============================================================================
 # TOOL HANDLERS  (each takes an `args` dict, returns a JSON-serialisable object)
 # =============================================================================
 def tool_open(args):
@@ -1024,9 +1225,92 @@ def tool_open(args):
     sid = uuid.uuid4().hex[:12]
     SESSIONS[sid] = {"path": path, "doc": doc, "opened_at": _now_iso()}
     log("opened {} as session {}".format(path, sid))
-    return {
+    result = {
         "session_id": sid,
         "path": path,
+        "paragraphs": len(doc.paragraphs),
+        "tables": len(doc.tables),
+    }
+
+    # If a knowledge-base folder is configured, mirror the document to Markdown
+    # for RAG ingestion. This is a side effect of reading a document and must
+    # never break the open, so any failure is reported but swallowed.
+    if KB_DIR:
+        try:
+            kb_path = _save_to_kb(doc, path)
+            log("saved to knowledge base: {}".format(kb_path))
+            result["knowledge_base"] = kb_path
+        except OSError as e:
+            log("knowledge-base save failed: {}".format(e))
+            result["knowledge_base_error"] = str(e)
+    return result
+
+
+def tool_create(args):
+    """
+    Create a NEW blank .docx in the output folder, open it as a session and
+    return the session_id. The model then builds it up with the add_/insert_
+    tools and persists it with msword_save (in place, or save-as elsewhere).
+    """
+    filename = _require(args, "filename")
+    if not isinstance(filename, str) or not filename.strip():
+        raise ToolError("filename must be a non-empty string")
+
+    # Confine to a bare filename: strip any directory components so the model
+    # cannot traverse out of the output folder via '..' or an absolute path.
+    name = os.path.basename(filename.strip().replace("\\", "/"))
+    if not name or name in (".", ".."):
+        raise ToolError("filename must be a real file name, not a path")
+    if not name.lower().endswith(".docx"):
+        name += ".docx"
+
+    out_dir = OUTPUT_DIR or DOCUMENT_ROOT
+    if not out_dir:
+        raise ToolError(
+            "No output folder configured. Set --output-dir (or "
+            "MSWORD_OUTPUT_DIR), or --document-root."
+        )
+
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        raise ToolError("Could not create output folder {}: {}".format(out_dir, e))
+
+    target = os.path.join(os.path.realpath(os.path.expanduser(out_dir)), name)
+
+    if len(SESSIONS) >= MAX_SESSIONS:
+        raise ToolError(
+            "Too many open sessions ({}). Close some with msword_close.".format(
+                MAX_SESSIONS
+            )
+        )
+    if os.path.exists(target) and not bool(args.get("overwrite", False)):
+        raise ToolError(
+            "File already exists: {} (pass overwrite=true to replace it).".format(target)
+        )
+
+    doc = docx.Document()
+    title = args.get("title")
+    if title:
+        # Seed the document with a Title so the file is not empty on first save.
+        doc.add_heading(str(title), level=0)
+
+    try:
+        doc.save(target)
+    except PermissionError:
+        raise ToolError(
+            "Permission denied creating {} (is it open in Word?).".format(target)
+        )
+    except OSError as e:
+        raise ToolError("Could not create {}: {}".format(target, e))
+
+    sid = uuid.uuid4().hex[:12]
+    SESSIONS[sid] = {"path": target, "doc": doc, "opened_at": _now_iso()}
+    log("created {} as session {}".format(target, sid))
+    return {
+        "session_id": sid,
+        "path": target,
+        "created": True,
         "paragraphs": len(doc.paragraphs),
         "tables": len(doc.tables),
     }
@@ -1569,6 +1853,20 @@ TOOLS = [
         },
     },
     {
+        "name": "msword_create",
+        "description": "Create a NEW blank .docx in the server's output folder (set with --output-dir, separate from the knowledge-base folder; falls back to the document root) and open it as a session. Supply just a 'filename' (a '.docx' extension is added if missing; any folder part is ignored so files always land in the output folder). Optionally pass 'title' to seed a Title heading. Then build the document with msword_add_heading/msword_add_paragraph/msword_add_table etc. and persist it with msword_save (omit its 'path' to save in place in the output folder).",
+        "handler": tool_create,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "Name for the new file, e.g. 'status-report.docx'. Any directory part is stripped; the file is created in the configured output folder."},
+                "title": {"type": "string", "description": "Optional text for a Title heading added to the new document."},
+                "overwrite": {"type": "boolean", "default": False, "description": "Replace the file if it already exists (default false = error out)."},
+            },
+            "required": ["filename"],
+        },
+    },
+    {
         "name": "msword_close",
         "description": "Close a session and free its document. Unsaved changes are discarded.",
         "handler": tool_close,
@@ -1918,6 +2216,11 @@ def serve():
     log("tracked-change author: {}".format(AUTHOR))
     if DOCUMENT_ROOT:
         log("path sandbox DOCUMENT_ROOT = {}".format(DOCUMENT_ROOT))
+    log("new-document output folder = {}".format(OUTPUT_DIR or DOCUMENT_ROOT))
+    if KB_DIR:
+        log("knowledge-base mirroring enabled -> {}".format(KB_DIR))
+    else:
+        log("knowledge-base mirroring disabled (set --kb-dir to enable)")
 
     for line in sys.stdin:
         line = line.strip()
@@ -1949,7 +2252,7 @@ def serve():
 # =============================================================================
 def run_check():
     import tempfile
-    global DOCUMENT_ROOT
+    global DOCUMENT_ROOT, OUTPUT_DIR, KB_DIR
     docx_ver, lxml_ver = _versions()
     print("[check] interpreter : {}".format(sys.executable))
     print("[check] python-docx : {}".format(docx_ver))
@@ -2279,6 +2582,71 @@ def run_check():
         tool_close({"session_id": s8})
 
         print("[check] tracked-changes accept/reject by id: PASS")
+
+        # --- msword_create: new doc lands in the OUTPUT folder --------------
+        out_dir = os.path.join(tmpdir, "generated")
+        OUTPUT_DIR = out_dir
+        cres = tool_create({"session_id": None, "filename": "new report",
+                            "title": "New Report"})
+        assert cres["created"] and cres["path"] == os.path.join(
+            os.path.realpath(out_dir), "new report.docx"), \
+            "created file not in output folder: {}".format(cres["path"])
+        csid = cres["session_id"]
+        tool_add_heading({"session_id": csid, "text": "Section One", "level": 1})
+        tool_add_paragraph({"session_id": csid, "text": "Body text here."})
+        tool_add_table({"session_id": csid,
+                        "data": [["H1", "H2"], ["a", "b"]], "style": "Table Grid"})
+        tool_save({"session_id": csid})  # save in place, no path
+        assert os.path.isfile(cres["path"]), "created doc did not persist"
+        # A directory component in the filename must be ignored (no traversal).
+        cres2 = tool_create({"filename": "../escapee.docx"})
+        assert os.path.dirname(cres2["path"]) == os.path.realpath(out_dir), \
+            "filename directory part was not stripped"
+        tool_close({"session_id": cres2["session_id"]})
+        # overwrite guard.
+        try:
+            tool_create({"filename": "new report"})
+            raise AssertionError("expected overwrite guard to fire")
+        except ToolError:
+            pass
+        tool_close({"session_id": csid})
+        OUTPUT_DIR = None
+        print("[check] create-new-document: PASS")
+
+        # --- Markdown export / knowledge-base mirror on open ----------------
+        kb_dir = os.path.join(tmpdir, "kb")
+        KB_DIR = kb_dir
+        mdpath = os.path.join(tmpdir, "mirror me.docx")
+        md = docx.Document()
+        md.add_heading("Doc Title", level=0)
+        md.add_heading("Intro", level=1)
+        md.add_paragraph("A short paragraph.")
+        md.add_paragraph("First bullet", style="List Bullet")
+        md.add_paragraph("Second bullet", style="List Bullet")
+        t = md.add_table(rows=2, cols=2)
+        t.rows[0].cells[0].text = "Name"
+        t.rows[0].cells[1].text = "Value"
+        t.rows[1].cells[0].text = "alpha"
+        t.rows[1].cells[1].text = "1"
+        md.save(mdpath)
+        mres = tool_open({"path": mdpath})
+        kb_written = mres.get("knowledge_base")
+        assert kb_written and os.path.isfile(kb_written), \
+            "knowledge-base file not written on open"
+        with open(kb_written, encoding="utf-8") as fh:
+            kb_text = fh.read()
+        assert "# Doc Title" in kb_text, "Title not rendered as h1"
+        assert "# Intro" in kb_text, "Heading 1 not rendered"
+        assert "- First bullet" in kb_text and "- Second bullet" in kb_text, \
+            "bullets not rendered"
+        assert "| Name | Value |" in kb_text and "| --- | --- |" in kb_text, \
+            "table not rendered as Markdown"
+        assert "| alpha | 1 |" in kb_text, "table body not rendered"
+        assert os.path.basename(kb_written) == "Word - mirror me.md", \
+            "unexpected kb filename: {}".format(kb_written)
+        tool_close({"session_id": mres["session_id"]})
+        KB_DIR = None
+        print("[check] markdown-export / kb-mirror: PASS")
     except Exception as e:
         ok = False
         print("[check] round-trip: FAIL -> {}".format(e))
@@ -2324,13 +2692,34 @@ def main():
              "chooses open/save paths, so an unconfined server could "
              "read/write any .docx this account can."
     )
+    parser.add_argument(
+        "--output-dir", default=os.environ.get("MSWORD_OUTPUT_DIR"),
+        metavar="DIR",
+        help="Folder where msword_create writes NEW .docx files, kept SEPARATE "
+             "from the knowledge-base folder. Falls back to the MSWORD_OUTPUT_DIR "
+             "environment variable, then the OUTPUT_DIR config value, and finally "
+             "to the document root. Also treated as a permitted open/save "
+             "location so created documents can be reopened and edited."
+    )
+    parser.add_argument(
+        "--kb-dir", default=os.environ.get("MSWORD_KB_DIR"), metavar="DIR",
+        help="If set, every document opened with msword_open is ALSO written as "
+             "a Markdown file into this folder for a local RAG knowledge base "
+             "(falls back to the MSWORD_KB_DIR environment variable, then the "
+             "KB_DIR config value). Files are named 'Word - <name>.md' and "
+             "overwritten each time. The folder is created if it does not exist."
+    )
     args = parser.parse_args()
 
-    global AUTHOR, DOCUMENT_ROOT
+    global AUTHOR, DOCUMENT_ROOT, OUTPUT_DIR, KB_DIR
     if args.author:
         AUTHOR = args.author
     if args.document_root:
         DOCUMENT_ROOT = args.document_root
+    if args.output_dir:
+        OUTPUT_DIR = args.output_dir
+    if args.kb_dir:
+        KB_DIR = args.kb_dir
 
     if args.check:
         sys.exit(run_check())
