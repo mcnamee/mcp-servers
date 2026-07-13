@@ -35,7 +35,7 @@ refuse to start unconfined rather than fall back to "anywhere":
 
 | Server | Confined to | Required setting |
 |---|---|---|
-| `ms-word.py` | open/save only inside the document root | `--document-root` / `MSWORD_DOCUMENT_ROOT` / `DOCUMENT_ROOT` constant |
+| `ms-word.py` | open/save only inside the document root (and the output folder, if set); new docs written to the output folder; Markdown mirrored to the knowledge-base folder | `--document-root` / `MSWORD_DOCUMENT_ROOT` / `DOCUMENT_ROOT` constant (required); optional `--output-dir` and `--kb-dir` |
 | `ms-excel.py` | reads only inside the workbook folder | `--folder` / `EXCEL_WORKBOOK_FOLDER` / `WORKBOOK_FOLDER` constant |
 | `knowledge-base.py` | reads only inside the docs folder | `--docs-dir` / `REFERENCE_DOCS_DIR` |
 | `knowledge-base-semantic.py` | reads only inside the docs folder | `--docs-dir` / `KB_DOCS_DIR` |
@@ -284,6 +284,22 @@ mcpServers:
 | `--check` | Run an offline open/edit/save/reopen self-test and exit (no server) |
 | `--author` | Author name stamped on Word tracked changes. Falls back to the `MSWORD_AUTHOR` env var, then the `TRACKED_CHANGE_AUTHOR` config value in the file. Can also be overridden per-call via the `author` argument on the editing tools (`msword_replace_text`, `msword_set_paragraph_text`, `msword_insert_paragraph`, `msword_delete_paragraph`) |
 | `--document-root` | **Required.** Path sandbox: every open/save must be inside this directory tree, and the server refuses to start without one (`--check` is exempt — the self-test sandboxes itself to its own temp folder). Falls back to the `MSWORD_DOCUMENT_ROOT` env var, then the `DOCUMENT_ROOT` config value. This is the only write-capable server in the suite, and the model chooses the open/save paths |
+| `--output-dir` | Optional folder where `msword_create` writes **new** `.docx` files, kept **separate** from the knowledge-base folder. Falls back to the `MSWORD_OUTPUT_DIR` env var, then the `OUTPUT_DIR` config value, and finally to the document root. Also treated as a permitted open/save location so created documents can be reopened and edited |
+| `--kb-dir` | Optional. If set, **every document opened** with `msword_open` is *also* written out as a Markdown file into this folder for a local RAG knowledge base (like `confluence.py`'s `--kb-dir`). Falls back to the `MSWORD_KB_DIR` env var, then the `KB_DIR` config value. Files are named `Word - <name>.md` and overwritten each open; the folder is created if missing. Omit to disable mirroring |
+
+**Building a RAG knowledge base.** Point `--kb-dir` at the same folder your
+knowledge-base servers (`knowledge-base.py` / `knowledge-base-semantic.py`)
+index. Each time a `.docx` is opened, a Markdown copy is dropped there —
+headings become `#`/`##`, `List Bullet`/`List Number` paragraphs become `-`/`1.`
+lists, and tables become GitHub-style pipe tables — so Word content lands
+alongside the Confluence pages in the same RAG index.
+
+**Creating documents.** `msword_create` makes a new blank `.docx` in the
+`--output-dir` folder (falling back to the document root) and opens it as a
+session; build it up with `msword_add_heading` / `msword_add_paragraph` /
+`msword_add_table` and persist with `msword_save` (omit its `path` to save in
+place). Any directory part in the requested filename is stripped, so new files
+always land inside the output folder.
 
 Tracked changes are recorded the way Word itself records them: replacements
 are diffed **word-by-word** (only the words that actually change are marked
@@ -304,9 +320,16 @@ mcpServers:
       - Matt
       - --document-root
       - C:\Users\me\Documents\ai_docs
+      - --output-dir
+      - C:\Users\me\Documents\ai_generated
+      - --kb-dir
+      - C:\Users\me\Documents\rag_kb
     env:
       PYTHONUTF8: "1"
 ```
+
+`--output-dir` and `--kb-dir` are optional — drop those four lines to keep new
+documents in the document root and disable Markdown mirroring.
 
 ### pdf-to-md.py
 
@@ -395,19 +418,21 @@ one or more of the tools the server exposes.
 ### ms-word.py
 
 1. "Open the proposal.docx and show me its full text." → `msword_open` + `msword_get_content`
-2. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
-3. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
-4. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
-5. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
-6. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
-7. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
-8. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
-9. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
-10. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
-11. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
-12. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
-13. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
-14. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
+2. "Open every .docx in my docs folder so it gets mirrored into the RAG knowledge base as Markdown." → `msword_open` with `--kb-dir` set (each open writes `Word - <name>.md` next to the Confluence pages for `knowledge-base.py` / `knowledge-base-semantic.py` to index)
+3. "Create a new status report document and draft it with a title, headings and a summary table, then save it to my generated-docs folder." → `msword_create` (writes to `--output-dir`) + `msword_add_heading` + `msword_add_paragraph` + `msword_add_table` + `msword_save`
+5. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
+6. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
+7. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
+8. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
+9. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
+10. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
+11. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
+12. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
+13. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
+14. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
+15. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
+16. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
+17. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
 
 ### pdf-to-md.py
 
