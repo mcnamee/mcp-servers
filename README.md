@@ -13,7 +13,7 @@ launch the server with.
 | `confluence.py` | _none_ | standard library only |
 | `jira.py` | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
 | `knowledge-base.py` | _none_ | standard library only (keyword search) |
-| `knowledge-base-semantic.py` | _none_ | standard library only; meaning-based retrieval driven by your connected model (no local embedding model, no network) |
+| `knowledge-base-rag.py` | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
 | `ms-excel.py` | _none_ | standard library only (parses .xlsx as a zip of XML) |
 | `ms-word.py` | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
 | `ms-outlook.py` | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
@@ -22,7 +22,7 @@ launch the server with.
 ## Install everything at once
 
 ```
-pip install python-docx pymupdf pymupdf4llm pywin32
+pip install python-docx pymupdf pymupdf4llm pywin32 chromadb
 ```
 
 (Drop `pywin32` if you're not on Windows / not using `ms-outlook.py`.)
@@ -38,7 +38,7 @@ refuse to start unconfined rather than fall back to "anywhere":
 | `ms-word.py` | open/save only inside the document root (and the output folder, if set); new docs written to the output folder; Markdown mirrored to the knowledge-base folder | `--document-root` / `MSWORD_DOCUMENT_ROOT` / `DOCUMENT_ROOT` constant (required); optional `--output-dir` and `--kb-dir` |
 | `ms-excel.py` | reads only inside the workbook folder | `--folder` / `EXCEL_WORKBOOK_FOLDER` / `WORKBOOK_FOLDER` constant |
 | `knowledge-base.py` | reads only inside the docs folder | `--docs-dir` / `REFERENCE_DOCS_DIR` |
-| `knowledge-base-semantic.py` | reads only inside the docs folder | `--docs-dir` / `KB_DOCS_DIR` |
+| `knowledge-base-rag.py` | reads only inside the docs folder; writes only the vector-index folder (default `<docs-dir>\.kb-rag-index`); network only to the endpoint(s) you configure | `--docs-dir` / `KB_DOCS_DIR` + `--embed-url` / `KB_EMBED_URL` |
 | `pdf-to-md.py` | reads only the input folder, writes only the output folder | `--input-dir` + `--output-dir` (or `PDF2MD_INPUT_DIR`/`PDF2MD_OUTPUT_DIR`) |
 | `confluence.py` | no local file access unless `CONFLUENCE_KB_DIR` is set; then writes only inside that folder | n/a (mirroring is optional; unset = no file access) |
 | `jira.py` | no local file access (HTTP GET to Jira only; reads the optional `JIRA_CA_CERT` bundle once at startup) | n/a |
@@ -55,7 +55,7 @@ outside it.
   installed into the same interpreter your MCP client launches the server
   with, e.g.:
   ```
-  "C:\path\to\python.exe" -m pip install python-docx pymupdf pymupdf4llm pywin32
+  "C:\path\to\python.exe" -m pip install python-docx pymupdf pymupdf4llm pywin32 chromadb
   ```
 - For airgapped/offline installs, see the docstring at the top of
   `ms-word.py` for the wheel-sideloading steps (same pattern applies to
@@ -163,52 +163,93 @@ mcpServers:
       PYTHONUTF8: "1"
 ```
 
-> For meaning-based (rather than keyword) retrieval over the same kind of
-> folder, see `knowledge-base-semantic.py` below. You can run both at once
-> (different `name:` and folder).
+> For true vector (RAG) retrieval over the same kind of folder, see
+> `knowledge-base-rag.py` below. You can run both at once (different
+> `name:` and folder).
 
-### knowledge-base-semantic.py
+### knowledge-base-rag.py
 
-Meaning-based retrieval over a folder of your own markdown files (notes,
-policies, reference docs). Ask a question in your own words — e.g. *"can I
-extend my work trip by two days, pay my own weekend accommodation, and fly
-back Monday?"* — and the agent finds the relevant part of your travel policy
-and reasons over it, without you naming the file.
+True RAG (Retrieval-Augmented Generation) over a folder of your own markdown
+files, in three stages:
 
-**How it stays "semantic" with no embedding model and no network:** MCP has no
-way for a server to ask the client for embeddings, and Continue does not
-support MCP *sampling* (server-initiated LLM calls), so the server cannot call
-your model itself. Instead it hands the agent — which *is* the model you
-connect to — a compact, structure-aware **map** of the knowledge base
-(`kb_outline`: every document + its section headings + a one-line lead). The
-agent picks the right document/section by *meaning*, then reads exactly that
-section (`kb_read`). Retrieval by meaning, using the model you already talk to,
-with zero dependencies. (If you ever want true vector embeddings, that requires
-either a local embedding model or a remote embeddings API — neither of which
-this offline-friendly server uses.)
+1. **Index** — documents are split into heading-aware chunks, embedded via
+   your embeddings API endpoint, and stored in a local ChromaDB vector
+   database on disk. Indexing is incremental: only new/changed files are
+   re-embedded, deleted files are removed.
+2. **Retrieve** — a question is embedded the same way and the most
+   semantically similar chunks come back with source file, section heading
+   and similarity score.
+3. **Generate** — (optional) the retrieved chunks + question go to a
+   chat-completions endpoint, which writes a grounded answer citing its
+   sources. With no chat endpoint configured, `kb_ask` returns the retrieved
+   context and the agent you're already talking to writes the answer — so
+   generation works either way.
+
+Requires `pip install chromadb` (ChromaDB's anonymised telemetry is disabled
+in the file; HTTP to your endpoints is stdlib `urllib`). **API keys are
+env-var only** — there are deliberately no `--*-api-key` flags, because
+command-line arguments are visible to other local users in process listings.
+Note that retrieved document text *is* sent to the endpoints you configure —
+that is what RAG is — so point it only at material appropriate for those APIs.
 
 | Tool | Purpose |
 |---|---|
-| `kb_list` | List every document with its title (inventory) |
-| `kb_outline` | The map: every document's heading tree + a lead line per section — call this first for a topic question, then pick by meaning |
-| `kb_search` | Keyword search across all docs; reports the matching section heading and a snippet (fast lookup / narrowing a large KB) |
-| `kb_read` | Read one document in full, or just one named `section` of it (loose name/heading matching) |
+| `kb_index` | Build/update the vector index (incremental; `force=true` rebuilds — needed after changing embedding model) |
+| `kb_retrieve` | Semantic vector search: top-k most similar chunks, with source file, heading and similarity score |
+| `kb_ask` | Full RAG: retrieve, then generate a grounded cited answer (or return context for the agent, if no chat endpoint) |
+| `kb_status` | Documents vs index freshness + configuration summary (never shows keys) |
 
-| CLI flag | Purpose |
-|---|---|
-| `--docs-dir` | Folder of markdown/text docs to expose (`.md`/`.markdown`/`.txt`), searched recursively. Falls back to the `KB_DOCS_DIR` env var |
-| `--check` | List the folder's documents (and a heading count each) to stderr, then exit (no server) |
-| `--version` | Print version and exit |
+| Env var | CLI flag | Purpose |
+|---|---|---|
+| `KB_DOCS_DIR` | `--docs-dir` | **Required.** Folder of `.md`/`.markdown`/`.txt` docs, searched recursively |
+| `KB_INDEX_DIR` | `--index-dir` | ChromaDB folder (default `<docs-dir>\.kb-rag-index`) |
+| `KB_COLLECTION` | `--collection` | ChromaDB collection name (default `kb-rag`) |
+| `KB_EMBED_URL` | `--embed-url` | **Required.** Full URL of the embeddings endpoint |
+| `KB_EMBED_MODEL` | `--embed-model` | Model name sent in embed requests (omit if the endpoint fixes one) |
+| `KB_EMBED_API_KEY` | _(env only)_ | API key for the embeddings endpoint |
+| `KB_EMBED_AUTH_HEADER` | `--embed-auth-header` | Header the key is sent in — default `Authorization` (as `Bearer <key>`); any other name (e.g. Azure's `api-key`) sends the raw key |
+| `KB_EMBED_STYLE` | `--embed-style` | Request format: `openai` (default; batch `{"input": [...]}`) or `ollama` (`{"prompt": ...}` one-per-request). Response parsing also accepts bare `embedding`/`embeddings` shapes, so most bespoke internal endpoints work unchanged |
+| `KB_EMBED_BATCH` | `--embed-batch` | Texts per embeddings request, openai style (default 16) |
+| `KB_EMBED_QUERY_PREFIX` | `--embed-query-prefix` | Prefix for query embeds, for models that need it (e5-style `"query: "`) |
+| `KB_EMBED_DOC_PREFIX` | `--embed-doc-prefix` | Prefix for document embeds (`"passage: "`) |
+| `KB_EMBED_EXTRA_HEADERS` | _(env only)_ | JSON object of extra HTTP headers for the embed endpoint |
+| `KB_CHAT_URL` | `--chat-url` | *Optional.* Chat-completions endpoint for the generate step (OpenAI shape; Ollama `/api/chat` and `/api/generate` response shapes also parsed) |
+| `KB_CHAT_MODEL` | `--chat-model` | Generation model name |
+| `KB_CHAT_API_KEY` | _(env only)_ | API key for the chat endpoint (falls back to `KB_EMBED_API_KEY`) |
+| `KB_CHAT_AUTH_HEADER` | `--chat-auth-header` | As per `KB_EMBED_AUTH_HEADER` |
+| `KB_CHAT_MAX_TOKENS` | `--chat-max-tokens` | `max_tokens` for generation (default 1024; 0 omits the field) |
+| `KB_CHAT_EXTRA_HEADERS` | _(env only)_ | JSON object of extra HTTP headers for the chat endpoint |
+| `KB_CA_CERT` | `--ca-cert` | Path to a PEM CA bundle for an internal CA |
+| `KB_VERIFY_SSL=false` | `--insecure` | Disable TLS certificate verification |
+| `KB_TIMEOUT` | `--timeout` | HTTP timeout in seconds (default 120) |
+| `KB_CHUNK_CHARS` | `--chunk-chars` | Soft max characters per chunk (default 1500) |
+| `KB_CHUNK_OVERLAP` | `--chunk-overlap` | Overlap between adjacent chunks (default 200) |
+| `KB_TOP_K` | `--top-k` | Default chunks retrieved (default 5) |
+| — | `--check` | Validate config, call the endpoint(s) once, report index status, then exit |
+| — | `--reindex` | Build/update the vector index, then exit (add `--force` to rebuild from scratch) |
+| — | `--search QUERY` | Test retrieval from the command line, then exit |
+| — | `--ask QUESTION` | Test full RAG (retrieve + generate) from the command line, then exit |
+| — | `--version` | Print version and exit |
+
+First run (before wiring into the MCP client): `--check`, then `--reindex`,
+then `--search "some topic"` to confirm retrieval — the docstring at the top
+of the file walks through it. If you change embedding model, run
+`--reindex --force` once (vector dimensions differ between models).
 
 ```yaml
 mcpServers:
-  - name: kb
+  - name: kb-rag
     command: C:\path\to\python.exe
     args:
-      - C:\path\to\knowledge-base-semantic.py
+      - C:\path\to\knowledge-base-rag.py
       - --docs-dir
       - C:\Users\me\knowledge-base
+      - --embed-url
+      - https://ai-gateway.internal.example.com/v1/embeddings
+      - --embed-model
+      - text-embedding-3-small
     env:
+      KB_EMBED_API_KEY: your-api-key
       PYTHONUTF8: "1"
 ```
 
@@ -386,14 +427,13 @@ one or more of the tools the server exposes.
 3. "Read the full expense-reporting policy document and tell me the approval limits." → `reference_get`
 4. "Search our reference docs for anything about onboarding, then read whichever one covers IT equipment." → `reference_search` followed by `reference_get`
 
-### knowledge-base-semantic.py
+### knowledge-base-rag.py
 
-1. "Using my knowledge base, can I extend my work trip by 2 days, pay for my own accommodation for the weekend, and fly back Monday?" → `kb_outline` to map the docs, then `kb_read` (with a `section`) on the travel policy's trip-extension section, and reason over it
-2. "What's in my knowledge base?" → `kb_list`
-3. "Give me a map of everything in my knowledge base so I can see what topics are covered." → `kb_outline`
-4. "Find anything mentioning 'accommodation' or 'per diem'." → `kb_search`
-5. "Read just the 'Expense Claims' section of the travel policy." → `kb_read` with `section`
-6. "Open the whole onboarding checklist document." → `kb_read` (no `section`)
+1. "Using my knowledge base, can I extend my work trip by 2 days, pay for my own accommodation for the weekend, and fly back Monday?" → `kb_ask` (retrieves the travel policy's trip-extension chunks and generates a cited answer — or hands the agent the chunks to answer from, if no chat endpoint is configured)
+2. "Find the parts of our policies about accommodation and per diem." → `kb_retrieve`
+3. "I've added some new documents to the knowledge base folder — pick them up." → `kb_index` (incremental: only new/changed files are embedded)
+4. "Is the knowledge base index up to date? What's actually indexed?" → `kb_status`
+5. "Rebuild the whole knowledge base index from scratch (we switched embedding model)." → `kb_index` with `force=true`
 
 ### ms-excel.py
 
