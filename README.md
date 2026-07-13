@@ -42,7 +42,7 @@ refuse to start unconfined rather than fall back to "anywhere":
 | `pdf-to-md.py` | reads only the input folder, writes only the output folder | `--input-dir` + `--output-dir` (or `PDF2MD_INPUT_DIR`/`PDF2MD_OUTPUT_DIR`) |
 | `confluence.py` | no local file access unless `CONFLUENCE_KB_DIR` is set; then writes only inside that folder | n/a (mirroring is optional; unset = no file access) |
 | `jira.py` | no local file access (HTTP GET to Jira only; reads the optional `JIRA_CA_CERT` bundle once at startup) | n/a |
-| `ms-outlook.py` | no file access (local COM only; reads the optional `--blacklist-file` once at startup) | n/a |
+| `ms-outlook.py` | no local file access unless `--kb-dir` (`OUTLOOK_KB_DIR`) is set; then writes only inside that folder (reads the optional `--blacklist-file` once at startup) | n/a (mirroring is optional; unset = no file access) |
 
 In all cases paths are resolved (symlinks included) before the containment
 check, so a symlink dropped inside a configured folder cannot reach files
@@ -282,6 +282,7 @@ running, and logged into a profile.
 |---|---|
 | `--blacklist-file` | Path to a file of extra content-blacklist terms (one per line, `#` for comments), added to the built-in list. Falls back to the `OUTLOOK_BLACKLIST_FILE` env var |
 | `--search-folders` | Comma-separated folder names used as the **default** folder set for `outlook_search_recent`, overriding the `SEARCH_ALL_FOLDERS` value in the file (e.g. `"Inbox,Sent Items,Archive"`). A per-call `folders` argument still takes priority. Falls back to the `OUTLOOK_SEARCH_FOLDERS` env var |
+| `--kb-dir` | If set, every email read with `outlook_get_email` is *also* saved as a Markdown file into this folder for a local RAG knowledge base (like `confluence.py` / `ms-word.py`). Files are named `Email - <date> - <subject> (<id>).md` and overwritten on re-read of the same message; the folder is created at startup. **Blocked (blacklisted) messages are never written** — mirroring only runs after a message clears the content filter. Falls back to the `OUTLOOK_KB_DIR` env var, then the `KB_DIR` config constant. Omit to keep the server file-free (the default) |
 | `--require-blacklist` | Fail closed: refuse to start unless the content blacklist has at least one active term, so a missing/empty terms file cannot silently disable the compliance filter. Also via `OUTLOOK_REQUIRE_BLACKLIST=1` or the `REQUIRE_BLACKLIST` constant in the file |
 | `--check` | Connect to Outlook, print diagnostics + blacklist status to stderr, then exit (no server) |
 | `--version` | Print version and exit |
@@ -314,9 +315,16 @@ mcpServers:
       - C:\config\outlook-blacklist.txt
       - --search-folders
       - "Inbox,Sent Items,Archive"
+      - --kb-dir
+      - C:\reference-docs\outlook
     env:
       PYTHONUTF8: "1"
 ```
+
+`--kb-dir` is optional — drop those two lines to keep the server file-free
+(no emails written to disk). When set, point it at the same folder your
+knowledge-base servers (`knowledge-base.py` / `knowledge-base-rag.py`) index so
+read emails land alongside your Confluence pages and Word documents.
 
 ### ms-word.py
 
@@ -449,11 +457,12 @@ one or more of the tools the server exposes.
 1. "Show me my 10 most recent unread emails." → `outlook_list_recent_emails`
 2. "Search my inbox for anything from 'Jane Smith' about the contract renewal." → `outlook_search_emails`
 3. "Open that email from the vendor and summarise the key dates." → `outlook_get_email`
-4. "What's on my calendar for the next 7 days?" → `outlook_get_calendar`
-5. "What did I send last week?" → `outlook_list_sent_emails`
-6. "Find everything about the 'Acme renewal' across my Inbox, Sent Items and Archive from the last month." → `outlook_search_recent`
-7. "Search only my 'Projects' and 'Sent Items' folders for anything about the budget review." → `outlook_search_recent` with a `folders` argument overriding the default set
-8. "What are my actual Outlook folder names, so I can point the search at the right archive?" → `outlook_list_folders`
+4. "Read these project emails so they get saved into my RAG knowledge base as Markdown." → `outlook_get_email` with `--kb-dir` set (each cleared email is written to `Email - <date> - <subject> (<id>).md` for `knowledge-base.py` / `knowledge-base-rag.py` to index)
+5. "What's on my calendar for the next 7 days?" → `outlook_get_calendar`
+6. "What did I send last week?" → `outlook_list_sent_emails`
+7. "Find everything about the 'Acme renewal' across my Inbox, Sent Items and Archive from the last month." → `outlook_search_recent`
+8. "Search only my 'Projects' and 'Sent Items' folders for anything about the budget review." → `outlook_search_recent` with a `folders` argument overriding the default set
+9. "What are my actual Outlook folder names, so I can point the search at the right archive?" → `outlook_list_folders`
 
 ### ms-word.py
 
