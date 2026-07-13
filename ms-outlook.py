@@ -34,6 +34,17 @@ TOOLS EXPOSED (all read-only)
 - outlook_search_recent      : all mail across Inbox/Archive/Sent in a date range (configurable)
 - outlook_list_folders       : list every mail folder across all stores (to configure the above)
 
+OPTIONAL: Markdown export for a RAG knowledge base
+--------------------------------------------------
+Set --kb-dir (or OUTLOOK_KB_DIR, or the KB_DIR config constant) to a folder and
+every email read with outlook_get_email is ALSO written out as a Markdown file
+there, the same way confluence.py mirrors pages and ms-word.py mirrors
+documents, so the content can feed a local RAG index (e.g. alongside
+knowledge-base.py). Files are named 'Email - <date> - <subject> (<id>).md' and
+overwritten on re-read of the same message. Blocked (blacklisted) messages are
+NEVER written - the mirror only runs after a message has cleared the content
+filter. Leave it unset (the default) and the server keeps no local files.
+
 ==============================================================================
 CONFIGURATION  -  all editable settings live in the "USER CONFIGURATION" block
 just below this docstring. Edit them there; nothing else needs changing.
@@ -120,6 +131,8 @@ CONTINUE config.yaml ENTRY (copy/paste, adjust paths)
           - C:\\config\\outlook-blacklist.txt
           - --search-folders          # optional: default folders for outlook_search_recent
           - "Inbox,Sent Items,Archive"
+          - --kb-dir                  # optional: mirror each read email to Markdown for RAG
+          - C:\\reference-docs\\outlook
         env:
           PYTHONUTF8: "1"
 
@@ -146,6 +159,7 @@ import os
 import re
 import sys
 import json
+import hashlib
 import argparse
 import datetime
 import traceback
@@ -189,6 +203,20 @@ SEARCH_SCAN_CAP = 500       # ceiling on raw search hits scanned
 #        list to match your setup. (The separate outlook_list_sent_emails tool is
 #        unaffected by this list.)
 SEARCH_ALL_FOLDERS = ["Inbox", "Sent Items", "Archive"]
+
+# --- 6. KB_DIR  (optional Markdown export for a local RAG knowledge base).
+#        If set, EVERY email read with outlook_get_email is ALSO written out as
+#        a Markdown file into this folder, the same way confluence.py mirrors
+#        pages and ms-word.py mirrors documents, so the content can feed a local
+#        RAG index (e.g. alongside knowledge-base.py). Files are named
+#        'Email - <date> - <subject> (<id>).md' and overwritten on re-read of
+#        the same message. Blocked (blacklisted) messages are NEVER written -
+#        the mirror only runs once a message has cleared the content filter.
+#        Set it here, or at launch with --kb-dir / the OUTLOOK_KB_DIR
+#        environment variable (which take priority over this constant). Leave
+#        as None to disable mirroring (the default; the server keeps no files).
+#          e.g. KB_DIR = r"C:\Users\you\Documents\rag_kb\outlook"
+KB_DIR = None
 
 # ============================================================================
 # END USER CONFIGURATION  -  you should not need to edit below this line
@@ -673,6 +701,103 @@ def tool_search_emails(args):
     return header + "\n" + "\n".join(lines) + note
 
 
+# ---------------------------------------------------------------------------
+# Markdown export for the RAG knowledge base (mirrors confluence.py / ms-word.py)
+# ---------------------------------------------------------------------------
+
+def safe_filename(name, max_len=120):
+    """
+    Turn an email subject into a filesystem-safe filename component (no
+    extension). Strips characters illegal on Windows (< > : " / \\ | ? * and
+    control chars), collapses whitespace, removes trailing dots/spaces (also
+    illegal on Windows), and caps the length. Returns 'untitled' if nothing
+    usable is left.
+    """
+    if not name:
+        return "untitled"
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name)
+    cleaned = " ".join(cleaned.split()).strip(" .")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned or "untitled"
+
+
+def email_to_markdown(item, body):
+    """
+    Render a cleared email as Markdown: a metadata header (subject, sender,
+    recipients, received time) followed by the plain-text body. The body is
+    already plain text from Outlook, so no HTML conversion is needed.
+    """
+    def safe(getter, default=""):
+        try:
+            return getter() or default
+        except Exception:
+            return default
+
+    smtp = sender_smtp(item)
+    sender_line = safe(lambda: item.SenderName, "(unknown)")
+    if smtp:
+        sender_line += " <{0}>".format(smtp)
+
+    header = (
+        "# {subject}\n\n"
+        "- From: {sender}\n"
+        "- To: {to}\n"
+        "- CC: {cc}\n"
+        "- Received: {received}\n"
+        "- Saved: {stamp}\n\n"
+        "---\n\n"
+    ).format(
+        subject=safe(lambda: item.Subject, "(no subject)"),
+        sender=sender_line,
+        to=safe(lambda: item.To),
+        cc=safe(lambda: item.CC),
+        received=fmt_dt(safe(lambda: item.ReceivedTime)),
+        stamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+    body = body or ""
+    return header + (body if body.strip() else "(no body content)") + "\n"
+
+
+def save_email_to_kb(item, body):
+    """
+    Write a cleared email to '<KB_DIR>/Email - <date> - <subject> (<id>).md',
+    overwriting any existing file, for a local RAG knowledge base. Returns the
+    path written; raises OSError on failure.
+
+    The filename embeds the received date, a filesystem-safe subject and a short
+    hash of the EntryID, so the same message overwrites its own file while two
+    different messages that share a subject and date never collide.
+
+    Only ever called for messages that have already cleared the content
+    blacklist, so classified/withheld content is never written to disk.
+    """
+    def safe(getter, default=""):
+        try:
+            return getter() or default
+        except Exception:
+            return default
+
+    subject = safe(lambda: item.Subject, "(no subject)")
+    entry_id = safe(lambda: item.EntryID)
+    received = safe(lambda: item.ReceivedTime, None)
+    try:
+        date_part = received.strftime("%Y-%m-%d") if received else "no-date"
+    except Exception:
+        date_part = "no-date"
+
+    short = (hashlib.sha1(entry_id.encode("utf-8", "replace")).hexdigest()[:8]
+             if entry_id else "nohash")
+    filename = "Email - {0} - {1} ({2}).md".format(
+        date_part, safe_filename(subject), short)
+
+    os.makedirs(KB_DIR, exist_ok=True)
+    path = os.path.join(KB_DIR, filename)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(email_to_markdown(item, body))
+    return path
+
+
 def tool_get_email(args):
     entry_id = (args.get("entry_id") or "").strip()
     if not entry_id:
@@ -693,10 +818,13 @@ def tool_get_email(args):
                 "content blacklist (classification / compliance policy).")
 
     try:
-        body = item.Body or ""
+        full_body = item.Body or ""
     except Exception:
         return ("This message cannot be displayed: its body could not be read and "
                 "therefore cannot be cleared for display.")
+    # The full body is what gets mirrored to the knowledge base; only the copy
+    # returned to the model is truncated (mirrors confluence.py's MAX_BODY rule).
+    body = full_body
     truncated_note = ""
     if len(body) > MAX_BODY_CHARS:
         body = body[:MAX_BODY_CHARS]
@@ -722,7 +850,21 @@ def tool_get_email(args):
         "",
         body + truncated_note,
     ]
-    return "\n".join(parts)
+    result_text = "\n".join(parts)
+
+    # If a knowledge-base folder is configured, mirror the (cleared) email to
+    # Markdown for RAG ingestion. This is a side effect of reading and must
+    # never break the tool, so any failure is reported but swallowed. The FULL
+    # body is saved (MAX_BODY_CHARS only trims the copy returned to the model).
+    if KB_DIR:
+        try:
+            kb_path = save_email_to_kb(item, full_body)
+            log("Saved email to knowledge base: {0}".format(kb_path))
+            result_text += "\n\n[Saved to knowledge base: {0}]".format(kb_path)
+        except OSError as exc:
+            log("Knowledge-base save failed: {0}".format(exc))
+            result_text += "\n\n[Knowledge-base save FAILED: {0}]".format(exc)
+    return result_text
 
 
 def tool_list_sent_emails(args):
@@ -1114,7 +1256,9 @@ TOOLS = [
         "description": (
             "Retrieve the full details and plain-text body of a single email, "
             "identified by the EntryID from a list or search result. The message "
-            "may be withheld if it is blocked by a content policy."
+            "may be withheld if it is blocked by a content policy. If a "
+            "knowledge-base folder is configured (--kb-dir), the cleared email is "
+            "also saved as a Markdown file there for a local RAG knowledge base."
         ),
         "inputSchema": {
             "type": "object",
@@ -1222,7 +1366,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "outlook-mcp", "version": "1.4.0"}
+SERVER_INFO = {"name": "outlook-mcp", "version": "1.5.0"}
 
 
 def rpc_result(req_id, result):
@@ -1327,6 +1471,7 @@ def run_check():
         cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR)
         log("Calendar folder     : {0}".format(cal.Name))
         log("Search folders      : {0}".format(", ".join(_SEARCH_FOLDERS)))
+        log("KB Markdown mirror  : {0}".format(KB_DIR if KB_DIR else "disabled (set --kb-dir to enable)"))
         log("CHECK OK - Outlook COM link is working.")
         return 0
     except Exception:
@@ -1375,11 +1520,35 @@ def main():
              "is mandatory, so a missing terms file cannot silently disable it.",
     )
     parser.add_argument(
+        "--kb-dir",
+        default=os.environ.get("OUTLOOK_KB_DIR"),
+        help="If set, every email read with outlook_get_email is ALSO saved as a "
+             "Markdown file into this folder for a local RAG knowledge base (like "
+             "confluence.py / ms-word.py). Files are named "
+             "'Email - <date> - <subject> (<id>).md' and overwritten on re-read. "
+             "Blocked (blacklisted) messages are never written. Falls back to the "
+             "OUTLOOK_KB_DIR environment variable, then the KB_DIR config constant.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="outlook-mcp {0}".format(SERVER_INFO["version"]),
     )
     args = parser.parse_args()
+
+    # Optional Markdown knowledge-base mirror. Resolve the folder now and make
+    # sure it is usable so a misconfiguration is caught at startup, not on the
+    # first email read.
+    if args.kb_dir:
+        global KB_DIR
+        KB_DIR = args.kb_dir
+    if KB_DIR:
+        try:
+            os.makedirs(KB_DIR, exist_ok=True)
+        except OSError as exc:
+            log("FATAL: could not create/use --kb-dir {0}: {1}".format(KB_DIR, exc))
+            sys.exit(2)
+        log("Knowledge-base mirroring enabled -> {0}".format(KB_DIR))
 
     # Load any external blacklist terms and compile the filter BEFORE serving.
     extra_terms = []
