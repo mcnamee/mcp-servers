@@ -220,7 +220,10 @@ that is what RAG is — so point it only at material appropriate for those APIs.
 | `KB_CHAT_MAX_TOKENS` | `--chat-max-tokens` | `max_tokens` for generation (default 1024; 0 omits the field) |
 | `KB_CHAT_EXTRA_HEADERS` | _(env only)_ | JSON object of extra HTTP headers for the chat endpoint |
 | `KB_CA_CERT` | `--ca-cert` | Path to a PEM CA bundle for an internal CA |
-| `KB_VERIFY_SSL=false` | `--insecure` | Disable TLS certificate verification |
+| `KB_CLIENT_CERT` | `--client-cert` | Path to a PEM client certificate, for gateways that require **mutual TLS (mTLS)** — the fix for errors like `CERTIFICATE_NOT_PROVIDED` / `certificate required`. Presented to both endpoints. Loaded once at startup, so a bad path/passphrase fails immediately |
+| `KB_CLIENT_KEY` | `--client-key` | Path to the PEM private key for the client certificate; omit if the `--client-cert` file contains both cert and key |
+| `KB_CLIENT_KEY_PASSWORD` | _(env only)_ | Passphrase, if the client private key is encrypted |
+| `KB_VERIFY_SSL=false` | `--insecure` | Disable TLS certificate verification. Note this cannot fix an mTLS error — it controls how *you* verify the *server*, not the certificate you present to it (that's `--client-cert`) |
 | `KB_TIMEOUT` | `--timeout` | HTTP timeout in seconds (default 120) |
 | `KB_CHUNK_CHARS` | `--chunk-chars` | Soft max characters per chunk (default 1500) |
 | `KB_CHUNK_OVERLAP` | `--chunk-overlap` | Overlap between adjacent chunks (default 200) |
