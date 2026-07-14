@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-ms-excel.py (v2.0.0) -- Read-only Excel (.xlsx) MCP server for VSCode
+ms-excel.py (v2.1.0) -- Read-only Excel (.xlsx) MCP server for VSCode
 Continue / Cline.
 
 PURPOSE
@@ -21,8 +21,13 @@ PURPOSE
 
     Design mirrors the other servers in this suite: stdout is reserved for
     JSON-RPC only, all diagnostics go to stderr, config lives in one fenced
-    block below, workbook names are resolved fuzzily, and a --check flag
-    validates the environment before wiring into Continue.
+    block below, and a --check flag validates the environment before wiring
+    into Continue. Workbook names are resolved forgivingly: exact filename,
+    then name without extension, then case-insensitive, then a unique
+    substring, and finally a FUZZY name match (difflib) - so "budgit q3" or
+    "q3 budget" still opens "Budget Q3 2024.xlsx". A genuinely ambiguous name
+    lists the candidates instead of guessing; use excel_list_workbooks to see
+    what is available. (The fuzzy fallback is logged to stderr for audit.)
 
 SUPPORTED / NOT SUPPORTED
     * Supported: .xlsx (and macro-enabled .xlsm, same underlying format).
@@ -102,12 +107,13 @@ PROTOCOL NOTE
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import sys
 import os
 import io
 import json
+import difflib
 import argparse
 import zipfile
 import xml.etree.ElementTree as ET
@@ -133,6 +139,18 @@ MAX_ROWS_PER_READ = 200      # max rows returned by excel_read_range in one call
 MAX_COLS_PER_READ = 64       # max columns returned per row
 MAX_SEARCH_HITS = 100        # max matches returned by excel_search
 MAX_CELL_TEXT_LEN = 500      # long cell text is truncated to this many chars
+
+# Workbook-name matching. An exact/substring match always wins; only when none
+# is found does resolve_workbook_path fall back to a FUZZY match on the name, so
+# a near-miss like "budgit" or "q3 budget" still finds "Budget Q3 2024.xlsx".
+# These tune that fallback (same values as ms-word.py / pdf-to-md.py):
+#   FUZZY_MIN_RATIO       - below this similarity, AND with no shared words, a
+#                           name is treated as "no match" rather than opened.
+#   FUZZY_AMBIGUITY_DELTA - if a runner-up scores within this of the best, the
+#                           match is too close to call and the candidates are
+#                           listed instead of one being opened silently.
+FUZZY_MIN_RATIO = 0.40
+FUZZY_AMBIGUITY_DELTA = 0.05
 
 # Server identity reported to the client.
 SERVER_NAME = "excel-readonly"
@@ -618,11 +636,63 @@ def list_workbook_files(folder):
     return sorted(out)
 
 
+def _normalise_name(text):
+    """Lowercase, turn separators into spaces and collapse whitespace, so fuzzy
+    matching ignores punctuation/case differences between a query and a name."""
+    text = text.lower()
+    for ch in ("_", "-", ".", "(", ")", "[", "]", ",", "&", "+"):
+        text = text.replace(ch, " ")
+    return " ".join(text.split())
+
+
+def _score_name(query_norm, name_norm):
+    """Score a query against a name as (token-containment, sequence-ratio): the
+    fraction of query words present in the name, then difflib's overall
+    similarity. Ranking on the pair prefers names that contain the query words
+    and, among those, the closest overall string."""
+    q_tokens = query_norm.split()
+    n_tokens = set(name_norm.split())
+    contained = (sum(1 for t in q_tokens if t in n_tokens) / len(q_tokens)) if q_tokens else 0.0
+    ratio = difflib.SequenceMatcher(None, query_norm, name_norm).ratio()
+    return (contained, ratio)
+
+
+def _fuzzy_match_workbook(files, requested):
+    """
+    Fuzzy-match `requested` against workbook file names. Returns (best, tied):
+    best is the single closest name, or None when nothing is close enough;
+    `tied` lists the near-equal candidates when the match is too ambiguous to
+    pick one. Matching is on the file stem (name without extension).
+    """
+    query_norm = _normalise_name(os.path.splitext(os.path.basename(str(requested)))[0])
+    if not query_norm or not files:
+        return None, []
+    scored = [
+        (f, _score_name(query_norm, _normalise_name(os.path.splitext(f)[0])))
+        for f in files
+    ]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    best, (best_contained, best_ratio) = scored[0]
+    # Nothing shares a word and the closest name is still too different.
+    if best_contained == 0.0 and best_ratio < FUZZY_MIN_RATIO:
+        return None, []
+    tied = []
+    for f, (contained, ratio) in scored:
+        if contained == best_contained and (best_ratio - ratio) <= FUZZY_AMBIGUITY_DELTA:
+            tied.append(f)
+        else:
+            break
+    if len(tied) > 1:
+        return None, tied
+    return best, []
+
+
 def resolve_workbook_path(folder, requested):
     """
     Resolve a loosely specified workbook name to a full path.
-    Matching order: exact -> exact+ext -> case-insensitive -> substring.
-    Rejects any path that escapes the configured folder.
+    Matching order: exact -> exact+ext -> case-insensitive -> substring ->
+    FUZZY (difflib name match, last resort). Rejects any path that escapes the
+    configured folder.
     """
     files = list_workbook_files(folder)
     if not files:
@@ -650,6 +720,18 @@ def resolve_workbook_path(folder, requested):
         raise WorkbookError(
             "Workbook '%s' is ambiguous. Candidates: %s"
             % (requested, ", ".join(hits))
+        )
+
+    # No exact/substring match - fall back to a fuzzy name match, so a near-miss
+    # like "budgit" or "q3 budget" still finds "Budget Q3 2024.xlsx".
+    best, tied = _fuzzy_match_workbook(files, requested)
+    if best is not None:
+        log("fuzzy-matched workbook '%s' -> %s" % (requested, best))
+        return os.path.join(folder, best)
+    if tied:
+        raise WorkbookError(
+            "Workbook '%s' matches several about equally well: %s. Be more "
+            "specific or use excel_list_workbooks." % (requested, ", ".join(tied))
         )
     raise WorkbookError(
         "Workbook '%s' not found. Available: %s"

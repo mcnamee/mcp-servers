@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-ms-word.py (v2.0.0) - A single-file MCP (Model Context Protocol) stdio server
+ms-word.py (v2.1.0) - A single-file MCP (Model Context Protocol) stdio server
 that gives an AI agent read/search/edit/generate access to Word .docx files.
 
 It follows a simple open -> edit -> save workflow (msword_open ... msword_save),
@@ -11,8 +11,10 @@ WHAT IT CAN DO
     - Open a .docx into an in-memory session, keyed by session_id. You can pass
       just the file NAME (e.g. "Policy 103.docx") - paths are resolved relative
       to the document root, so no absolute path is needed; a bare name is even
-      found in a subfolder of the root. List what is available with
-      msword_list_documents.
+      found in a subfolder of the root. If no exact match exists, a FUZZY name
+      match is tried (so "budget policy" opens "Budget Policy 2024.docx"), and
+      the result is flagged (fuzzy_matched) so the caller can confirm the pick.
+      List what is available with msword_list_documents.
     - Create a NEW .docx from scratch (msword_create) in a configurable output
       folder, then build it up with the add_/insert_ tools and save it.
     - On open, optionally MIRROR the document to Markdown into a knowledge-base
@@ -180,7 +182,7 @@ failed transfer" rule):
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # =============================================================================
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
@@ -227,6 +229,18 @@ KB_DIR = None
 
 MAX_SESSIONS = 32                    # guard against runaway open() calls
 SEARCH_CONTEXT_CHARS = 40            # chars of context either side of a match
+
+# msword_open name matching. An exact filename always wins; only when no exact
+# match is found does the server fall back to a FUZZY match on the name, so a
+# near-miss like "budget policy" still finds "Budget Policy 2024.docx". These
+# tune that fallback (same values as pdf-to-md.py):
+#   FUZZY_MIN_RATIO       - below this similarity, AND with no shared words, a
+#                           name is treated as "no match" rather than opened.
+#   FUZZY_AMBIGUITY_DELTA - if a runner-up scores within this of the best, the
+#                           match is too close to call and the candidates are
+#                           listed instead of one being opened silently.
+FUZZY_MIN_RATIO = 0.40
+FUZZY_AMBIGUITY_DELTA = 0.05
 
 # Default author name stamped on tracked changes (w:author). Override per
 # launch with:  --author "Matt"  in Continue's args: block. The date on each
@@ -472,6 +486,62 @@ def _find_docx_by_name(name):
     if not want.endswith(".docx"):
         want += ".docx"
     return [p for p in _all_docx_files() if os.path.basename(p).lower() == want]
+
+
+def _normalise_name(text):
+    """Lowercase, turn separators into spaces and collapse whitespace, so fuzzy
+    matching ignores punctuation/case differences between a query and a name."""
+    text = text.lower()
+    for ch in ("_", "-", ".", "(", ")", "[", "]", ",", "&", "+"):
+        text = text.replace(ch, " ")
+    return " ".join(text.split())
+
+
+def _score_name(query_norm, name_norm):
+    """Score a query against a name as (token-containment, sequence-ratio):
+    the fraction of query words present in the name, then difflib's overall
+    similarity. Ranking on the pair prefers names that contain the query words
+    and, among those, the closest overall string."""
+    q_tokens = query_norm.split()
+    n_tokens = set(name_norm.split())
+    contained = (sum(1 for t in q_tokens if t in n_tokens) / len(q_tokens)) if q_tokens else 0.0
+    ratio = difflib.SequenceMatcher(None, query_norm, name_norm).ratio()
+    return (contained, ratio)
+
+
+def _fuzzy_match_docx(name):
+    """
+    Fuzzy-match `name` against the .docx files under the permitted roots.
+    Returns (best_path, tied): best_path is the single best match, or None when
+    nothing is close enough; `tied` lists the near-equal candidates when the
+    match is too ambiguous to pick one. Matching is on the file's stem (its name
+    without the .docx extension).
+    """
+    files = _all_docx_files()
+    if not files:
+        return None, []
+    query_stem = os.path.splitext(os.path.basename(name.strip().replace("\\", "/")))[0]
+    query_norm = _normalise_name(query_stem)
+    if not query_norm:
+        return None, []
+    scored = [
+        (p, _score_name(query_norm, _normalise_name(os.path.splitext(os.path.basename(p))[0])))
+        for p in files
+    ]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    best_path, (best_contained, best_ratio) = scored[0]
+    # Nothing shares a word and the closest name is still too different.
+    if best_contained == 0.0 and best_ratio < FUZZY_MIN_RATIO:
+        return None, []
+    tied = []
+    for p, (contained, ratio) in scored:
+        if contained == best_contained and (best_ratio - ratio) <= FUZZY_AMBIGUITY_DELTA:
+            tied.append(p)
+        else:
+            break
+    if len(tied) > 1:
+        return None, tied
+    return best_path, []
 
 
 def _get_session(args):
@@ -1313,6 +1383,7 @@ def _save_to_kb(doc, source_path):
 def tool_open(args):
     raw = _require(args, "path")
     path = _resolve_path(raw)
+    fuzzy_matched = False
     if not os.path.isfile(path):
         # Not at the resolved location. Fall back to a basename lookup anywhere
         # under the permitted roots, so "Policy 103.docx" opens even when it
@@ -1328,11 +1399,26 @@ def tool_open(args):
                     os.path.basename(raw.replace("\\", "/")), listing)
             )
         else:
-            raise ToolError(
-                "File not found: '{}'. Paths are resolved relative to the "
-                "document root; call msword_list_documents to see what is "
-                "available.".format(raw)
-            )
+            # No exact filename match - fall back to a fuzzy match on the name,
+            # so a near-miss like "budget policy" still finds the right file.
+            best, tied = _fuzzy_match_docx(raw)
+            if best is not None:
+                log("fuzzy-matched '{}' -> {}".format(raw, best))
+                path = best
+                fuzzy_matched = True
+            elif tied:
+                listing = ", ".join(_display_path(m) for m in tied)
+                raise ToolError(
+                    "'{}' matches several documents about equally well: {}. "
+                    "Re-open with the exact name or path, or call "
+                    "msword_list_documents.".format(raw, listing)
+                )
+            else:
+                raise ToolError(
+                    "File not found: '{}'. Paths are resolved relative to the "
+                    "document root; call msword_list_documents to see what is "
+                    "available.".format(raw)
+                )
     if not path.lower().endswith(".docx"):
         raise ToolError("Only .docx files are supported (got: {})".format(path))
     if len(SESSIONS) >= MAX_SESSIONS:
@@ -1358,6 +1444,11 @@ def tool_open(args):
         "paragraphs": len(doc.paragraphs),
         "tables": len(doc.tables),
     }
+    if fuzzy_matched:
+        # The opened file's name differs from what was asked for; surface it so
+        # the caller can confirm it picked the intended document.
+        result["fuzzy_matched"] = True
+        result["requested"] = raw
 
     # If a knowledge-base folder is configured, mirror the document to Markdown
     # for RAG ingestion. This is a side effect of reading a document and must
@@ -2001,7 +2092,7 @@ def tool_reject_all_changes(args):
 TOOLS = [
     {
         "name": "msword_open",
-        "description": "Open a .docx file into an in-memory session and return a session_id used by all other tools. Just pass the file name (e.g. 'Policy 103.docx') - it is resolved relative to the server's document root, so you do NOT need an absolute path. A relative sub-path ('policies/Policy 103.docx') and absolute/~ paths also work. If a bare name is not at the top level, the server searches the document root's subfolders for it. Use msword_list_documents if you are unsure of the exact name.",
+        "description": "Open a .docx file into an in-memory session and return a session_id used by all other tools. Just pass the file name (e.g. 'Policy 103.docx') - it is resolved relative to the server's document root, so you do NOT need an absolute path. A relative sub-path ('policies/Policy 103.docx') and absolute/~ paths also work. If a bare name is not at the top level, the server searches the document root's subfolders for it. If no exact match is found, it falls back to a FUZZY name match (so 'budget policy' can open 'Budget Policy 2024.docx'); when a fuzzy match is used the result includes fuzzy_matched=true and the requested text, so confirm it opened the file you meant. Use msword_list_documents if you are unsure of the exact name.",
         "handler": tool_open,
         "inputSchema": {
             "type": "object",
@@ -2523,6 +2614,43 @@ def run_check():
         assert [d["name"] for d in filtered["documents"]] == ["Policy 103.docx"], \
             "list_documents query filter wrong: {}".format(filtered["documents"])
         print("[check] open-by-name / list-documents: PASS")
+
+        # --- Fuzzy open: a near-miss name still finds the right file ---------
+        for fn, body in [("Budget Policy 2024.docx", "Budget policy body."),
+                         ("Report A.docx", "Report A body."),
+                         ("Report B.docx", "Report B body.")]:
+            dd = docx.Document()
+            dd.add_paragraph(body)
+            dd.save(os.path.join(tmpdir, fn))
+
+        # A near-miss name fuzzy-matches, and the result is flagged so the
+        # caller can confirm it opened the intended file.
+        fz = tool_open({"path": "budget policy"})
+        assert os.path.basename(fz["path"]) == "Budget Policy 2024.docx", \
+            "fuzzy open picked the wrong file: {}".format(fz["path"])
+        assert fz.get("fuzzy_matched") is True and fz.get("requested") == "budget policy", \
+            "fuzzy open did not flag the match: {}".format(fz)
+        tool_close({"session_id": fz["session_id"]})
+
+        # An exact name still wins and is NOT flagged as fuzzy.
+        ex = tool_open({"path": "Budget Policy 2024.docx"})
+        assert "fuzzy_matched" not in ex, "exact open should not be fuzzy"
+        tool_close({"session_id": ex["session_id"]})
+
+        # An ambiguous query lists candidates instead of guessing one.
+        try:
+            tool_open({"path": "report"})
+            raise AssertionError("expected an ambiguity error")
+        except ToolError as e:
+            assert "equally well" in str(e), "unexpected ambiguity error: {}".format(e)
+
+        # A wholly unrelated name still fails cleanly (no bad silent match).
+        try:
+            tool_open({"path": "zzz totally unrelated qqq"})
+            raise AssertionError("expected a not-found error")
+        except ToolError as e:
+            assert "not found" in str(e).lower(), "unexpected miss error: {}".format(e)
+        print("[check] fuzzy-open: PASS")
 
         # --- Tracked changes 1: simple word replace, accept + reject --------
         tpath = os.path.join(tmpdir, "tracked.docx")
