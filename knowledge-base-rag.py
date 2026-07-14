@@ -55,7 +55,9 @@ ONLY (command lines are visible to other local users in process listings).
 | KB_EMBED_API_KEY        | (env only)           | API key for the embeddings endpoint                         |
 | KB_EMBED_AUTH_HEADER    | --embed-auth-header  | Header the key is sent in. Default Authorization (Bearer);  |
 |                         |                      | any other name (e.g. api-key for Azure) sends the raw key   |
-| KB_EMBED_STYLE          | --embed-style        | Request format: openai (default) or ollama                  |
+| KB_EMBED_STYLE          | --embed-style        | Request format: openai (default), ollama, or kserve-jina    |
+|                         |                      | (KServe V2 inference protocol, e.g. a Jina model on KServe) |
+| KB_EMBED_TENSOR_NAME    | --embed-tensor-name  | kserve-jina only: name of the input tensor (default: text)  |
 | KB_EMBED_BATCH          | --embed-batch        | Texts per embeddings request (default 16; ollama is 1-by-1) |
 | KB_EMBED_QUERY_PREFIX   | --embed-query-prefix | Prefix for query embeds (e5-style models: "query: ")        |
 | KB_EMBED_DOC_PREFIX     | --embed-doc-prefix   | Prefix for document embeds ("passage: ")                    |
@@ -79,10 +81,24 @@ ONLY (command lines are visible to other local users in process listings).
 | KB_TOP_K                | --top-k              | Default number of chunks retrieved (default 5)              |
 
 Endpoint formats ("where you have unknowns"):
-  --embed-style openai  : POST {"input": [texts], "model": m}
-                          reads response["data"][i]["embedding"]
-  --embed-style ollama  : POST {"model": m, "prompt": text} (one per request)
-                          reads response["embedding"]
+  --embed-style openai      : POST {"input": [texts], "model": m}
+                              reads response["data"][i]["embedding"]
+  --embed-style ollama      : POST {"model": m, "prompt": text} (one per request)
+                              reads response["embedding"]
+  --embed-style kserve-jina : KServe V2 Open Inference Protocol, as used by a
+                              Jina embeddings model served on KServe. POSTs
+                                {"inputs": [{"name": <tensor>, "shape": [N],
+                                 "datatype": "BYTES", "data": [texts]}]}
+                              and reads response["outputs"][...]["data"],
+                              reshaping a flat FP32 array via the tensor's
+                              "shape" [N, dim] (nested data also accepted).
+                              The model name is part of the URL, e.g.
+                              https://host/v2/models/jina-embeddings/infer
+                              so --embed-model is not sent. If your
+                              deployment names its input tensor differently,
+                              set --embed-tensor-name (default: text).
+                              KServe V1 ({"instances": [...]} ->
+                              {"predictions": [...]}) is also parsed.
   Response parsing also falls back to top-level "embedding"/"embeddings",
   so most bespoke internal endpoints work with style=openai unchanged.
   Generation POSTs OpenAI chat-completions JSON and falls back to Ollama
@@ -195,6 +211,7 @@ class Config(object):
     embed_key = ""
     embed_auth_header = "Authorization"
     embed_style = "openai"
+    embed_tensor_name = "text"
     embed_batch = 16
     embed_query_prefix = ""
     embed_doc_prefix = ""
@@ -377,11 +394,60 @@ def http_post_json(url, payload, headers):
 # Embeddings client
 # ---------------------------------------------------------------------------
 
+def _vectors_from_tensor(raw, shape, expected):
+    """
+    Turn a KServe output tensor's `data` into a list of vectors. `raw` is
+    either already nested ([[...], [...]]) or a flat float array that must be
+    reshaped using the tensor's `shape` (e.g. [N, dim]).
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    if isinstance(raw[0], list):
+        return raw
+    # Flat array: work out the vector length, preferring the declared shape.
+    if isinstance(shape, list) and len(shape) >= 2 and shape[-1]:
+        dim = int(shape[-1])
+    elif len(raw) % expected == 0:
+        dim = len(raw) // expected
+    else:
+        return None
+    if dim <= 0 or len(raw) % dim != 0:
+        return None
+    return [raw[i:i + dim] for i in range(0, len(raw), dim)]
+
+
+def _parse_kserve_response(data, expected):
+    """
+    Pull `expected` vectors out of a KServe response. V2 Open Inference
+    Protocol: {"outputs": [{"name", "shape", "datatype", "data"}]} where
+    `data` is typically a flat FP32 array reshaped via `shape`. V1 fallback:
+    {"predictions": [[...], ...]}. Returns None if nothing matches (the
+    caller raises the descriptive error).
+    """
+    if not isinstance(data, dict):
+        return None
+    outputs = data.get("outputs")
+    if isinstance(outputs, list):
+        # More than one output tensor is possible (e.g. token-level plus
+        # pooled embeddings); take the first one that yields `expected` rows.
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            vectors = _vectors_from_tensor(
+                output.get("data"), output.get("shape"), expected)
+            if vectors is not None and len(vectors) == expected:
+                return vectors
+    predictions = data.get("predictions")
+    if isinstance(predictions, list):
+        return _vectors_from_tensor(predictions, None, expected)
+    return None
+
+
 def _parse_embedding_response(data, expected):
     """
     Pull `expected` vectors out of an embeddings response, tolerating the
     common shapes: OpenAI {"data":[{"embedding":[...]}]}, bare {"embedding":
-    [...]}, and {"embeddings":[[...]]}.
+    [...]}, {"embeddings":[[...]]}, and KServe V2/V1 tensor responses.
     """
     vectors = None
     if isinstance(data, dict):
@@ -392,6 +458,8 @@ def _parse_embedding_response(data, expected):
             vectors = data["embeddings"]
         elif isinstance(data.get("embedding"), list):
             vectors = [data["embedding"]]
+        elif "outputs" in data or "predictions" in data:
+            vectors = _parse_kserve_response(data, expected)
     if (not vectors or len(vectors) != expected
             or any(not isinstance(v, list) or not v for v in vectors)):
         raise RagError(
@@ -420,6 +488,25 @@ def embed_texts(texts, is_query=False):
                 payload["model"] = CFG.embed_model
             data = http_post_json(CFG.embed_url, payload, headers)
             vectors.extend(_parse_embedding_response(data, 1))
+    elif CFG.embed_style == "kserve-jina":
+        # KServe V2 Open Inference Protocol: texts travel as one BYTES input
+        # tensor. The model name lives in the URL (/v2/models/<name>/infer),
+        # so no model field is sent. The content_type parameter is the V2
+        # string-codec hint (needed by MLServer-based deployments, ignored
+        # by others).
+        for start in range(0, len(inputs), CFG.embed_batch):
+            batch = inputs[start:start + CFG.embed_batch]
+            payload = {
+                "inputs": [{
+                    "name": CFG.embed_tensor_name,
+                    "shape": [len(batch)],
+                    "datatype": "BYTES",
+                    "parameters": {"content_type": "str"},
+                    "data": batch,
+                }],
+            }
+            data = http_post_json(CFG.embed_url, payload, headers)
+            vectors.extend(_parse_embedding_response(data, len(batch)))
     else:  # openai-compatible (the default)
         for start in range(0, len(inputs), CFG.embed_batch):
             batch = inputs[start:start + CFG.embed_batch]
@@ -884,8 +971,11 @@ def tool_kb_status(_args):
             lines.append("Index is up to date with the folder.")
     except Exception as exc:
         lines.append("Index status          : unavailable ({0})".format(exc))
+    style = CFG.embed_style
+    if style == "kserve-jina":
+        style += ", tensor: " + CFG.embed_tensor_name
     lines.append("Embeddings endpoint   : {0} (style: {1}, model: {2}, key: {3})".format(
-        CFG.embed_url, CFG.embed_style, CFG.embed_model or "(none)",
+        CFG.embed_url, style, CFG.embed_model or "(none)",
         "set" if CFG.embed_key else "NOT SET"))
     lines.append("Mutual TLS (client)   : {0}".format(
         "cert: {0}, key: {1}, passphrase: {2}".format(
@@ -996,7 +1086,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "knowledge-base-rag", "version": "1.1.0"}
+SERVER_INFO = {"name": "knowledge-base-rag", "version": "1.2.0"}
 
 SERVER_INSTRUCTIONS = (
     "This server is a RAG pipeline over a personal knowledge base of markdown "
@@ -1188,9 +1278,15 @@ def main():
     parser.add_argument("--embed-auth-header", default=env("KB_EMBED_AUTH_HEADER", "Authorization"),
                         help="Header for the embed API key; 'Authorization' sends 'Bearer <key>', "
                              "anything else (e.g. 'api-key') sends the raw key (env: KB_EMBED_AUTH_HEADER).")
-    parser.add_argument("--embed-style", choices=["openai", "ollama"],
+    parser.add_argument("--embed-style", choices=["openai", "ollama", "kserve-jina"],
                         default=env("KB_EMBED_STYLE", "openai"),
-                        help="Embeddings request format (env: KB_EMBED_STYLE; default: openai).")
+                        help="Embeddings request format (env: KB_EMBED_STYLE; default: openai). "
+                             "kserve-jina speaks the KServe V2 Open Inference Protocol "
+                             "(input tensors), e.g. a Jina embeddings model on KServe; "
+                             "the model name is part of the --embed-url path.")
+    parser.add_argument("--embed-tensor-name", default=env("KB_EMBED_TENSOR_NAME", "text"),
+                        help="kserve-jina style only: name of the input tensor the texts are "
+                             "sent as (env: KB_EMBED_TENSOR_NAME; default: text).")
     parser.add_argument("--embed-batch", type=int, default=int(env("KB_EMBED_BATCH", "16")),
                         help="Texts per embeddings request, openai style (env: KB_EMBED_BATCH; default: 16).")
     parser.add_argument("--embed-query-prefix", default=env("KB_EMBED_QUERY_PREFIX", ""),
@@ -1281,6 +1377,7 @@ def main():
     CFG.embed_key = os.environ.get("KB_EMBED_API_KEY", "")
     CFG.embed_auth_header = args.embed_auth_header
     CFG.embed_style = args.embed_style
+    CFG.embed_tensor_name = args.embed_tensor_name
     CFG.embed_batch = max(1, args.embed_batch)
     CFG.embed_query_prefix = args.embed_query_prefix
     CFG.embed_doc_prefix = args.embed_doc_prefix
