@@ -19,8 +19,8 @@ for the bump rules.
 | `jira.py` | 1.1.0 | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
 | `knowledge-base.py` | 2.0.0 | _none_ | standard library only (keyword search) |
 | `knowledge-base-rag.py` | 1.2.1 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
-| `ms-excel.py` | 2.0.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
-| `ms-word.py` | 2.0.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
+| `ms-excel.py` | 2.1.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
+| `ms-word.py` | 2.1.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
 | `ms-outlook.py` | 1.5.1 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
 | `pdf-to-md.py` | 4.0.0 | `pip install pymupdf pymupdf4llm` | OCR of scanned PDFs additionally requires Tesseract installed on the machine (not a pip package) |
 
@@ -333,6 +333,14 @@ mcpServers:
     env:
       PYTHONUTF8: "1"
 ```
+
+**Finding a workbook by name.** Every tool takes a `workbook` name, resolved
+forgivingly against the folder: exact filename → name without extension →
+case-insensitive → a unique substring → and finally a **fuzzy** name match
+(same matcher as `ms-word.py` / `pdf-to-md.py`), so *"budgit q3"* or *"q3
+budget"* still opens `Budget Q3 2024.xlsx`. A genuinely ambiguous name returns
+the candidate list rather than guessing; use `excel_list_workbooks` to see
+what's available. (Fuzzy fallbacks are logged to stderr for audit.)
 
 ### ms-outlook.py
 
@@ -661,7 +669,7 @@ one or more of the tools the server exposes.
 ### ms-excel.py
 
 1. "What Excel workbooks are available for me to look at?" → `excel_list_workbooks`
-2. "List the sheets in the 'budget' workbook." → `excel_list_sheets`
+2. "List the sheets in the 'budget' workbook." → `excel_list_sheets` (the `workbook` name is matched forgivingly — a near-miss like `"q3 budget"` still resolves to `Budget Q3 2024.xlsx`)
 3. "What are the column headers on the 'Q3' sheet of the budget workbook?" → `excel_get_headers`
 4. "Read rows A1:D50 from the Q3 sheet." → `excel_read_range`
 5. "Find every cell in the budget workbook that mentions 'Marketing'." → `excel_search`
