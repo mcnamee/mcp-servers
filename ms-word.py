@@ -8,7 +8,11 @@ It follows a simple open -> edit -> save workflow (msword_open ... msword_save),
 with the .docx engine provided by the Python library `python-docx`.
 
 WHAT IT CAN DO
-    - Open a .docx into an in-memory session, keyed by session_id.
+    - Open a .docx into an in-memory session, keyed by session_id. You can pass
+      just the file NAME (e.g. "Policy 103.docx") - paths are resolved relative
+      to the document root, so no absolute path is needed; a bare name is even
+      found in a subfolder of the root. List what is available with
+      msword_list_documents.
     - Create a NEW .docx from scratch (msword_create) in a configurable output
       folder, then build it up with the add_/insert_ tools and save it.
     - On open, optionally MIRROR the document to Markdown into a knowledge-base
@@ -178,7 +182,7 @@ failed transfer" rule):
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
 # =============================================================================
 SERVER_NAME = "msword-py"          # advertised to the MCP client
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 
 # REQUIRED path sandbox. The server refuses to open or save any file outside
@@ -187,6 +191,9 @@ PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 # .docx this account can. Set it here, or at launch with --document-root or
 # the MSWORD_DOCUMENT_ROOT environment variable (which take priority over
 # this constant). Symlinks are resolved before the containment check.
+# This root is ALSO the base for relative paths: a bare "Policy 103.docx" is
+# resolved against it (not the process CWD), so the model can open a file by
+# name without knowing its absolute path.
 #   e.g. DOCUMENT_ROOT = r"C:\Users\you\Documents\ai_docs"
 # (--check is exempt: the self-test sandboxes itself to its own temp folder.)
 # Related caution: only open .docx files from trusted sources - a maliciously
@@ -337,33 +344,123 @@ def _permitted_roots():
     return roots
 
 
-def _resolve_path(path):
+def _contained_in_root(rp):
     """
-    Expand + absolutise a path and enforce the write sandbox: the path must sit
-    inside one of the permitted roots (DOCUMENT_ROOT or, if set, OUTPUT_DIR).
-    realpath (not just abspath) so a symlink inside a root cannot point the
-    server at a file outside it.
+    Return the permitted root that contains resolved path `rp`, or None. A
+    symlink is already resolved by the caller (realpath), so a link inside a
+    root cannot smuggle the target outside it.
     """
-    if not isinstance(path, str) or not path.strip():
-        raise ToolError("Path must be a non-empty string")
-    rp = os.path.realpath(os.path.expanduser(path))
-    roots = _permitted_roots()
-    if not roots:
-        # main() refuses to start without a root; this guards direct callers.
-        raise ToolError("No DOCUMENT_ROOT is configured; file access is disabled.")
-    for root in roots:
+    for root in _permitted_roots():
         real_root = os.path.realpath(os.path.expanduser(root))
         try:
             # Different drives on Windows raise ValueError from commonpath.
             if os.path.commonpath([real_root, rp]) == real_root:
-                return rp
+                return real_root
         except ValueError:
             continue
-    raise ToolError(
-        "Path is outside the permitted folder(s) (DOCUMENT_ROOT"
-        + (" / OUTPUT_DIR" if OUTPUT_DIR else "")
-        + ") and was refused."
-    )
+    return None
+
+
+def _resolve_path(path):
+    """
+    Turn a caller-supplied path into an absolute, sandbox-checked path.
+
+    A RELATIVE path (e.g. just "Policy 103.docx") is resolved against the
+    permitted roots - the document root first, then the output folder - NOT
+    against the server process's current working directory. The CWD is wherever
+    the MCP client launched python and is almost never the document folder, so
+    resolving there is what made a bare filename fail the sandbox and forced the
+    model to guess absolute paths. When a relative name maps into more than one
+    root, an existing file is preferred; otherwise the document-root candidate
+    wins (the natural target for a new save-as).
+
+    An ABSOLUTE (or ~) path is taken as-is and must still fall inside a
+    permitted root. realpath is used throughout so symlinks are resolved before
+    the containment check.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise ToolError("Path must be a non-empty string")
+    roots = _permitted_roots()
+    if not roots:
+        # main() refuses to start without a root; this guards direct callers.
+        raise ToolError("No DOCUMENT_ROOT is configured; file access is disabled.")
+
+    expanded = os.path.expanduser(path.strip())
+    if os.path.isabs(expanded):
+        candidates = [os.path.realpath(expanded)]
+    else:
+        # Interpret the relative name inside each permitted root.
+        candidates = [
+            os.path.realpath(os.path.join(os.path.realpath(os.path.expanduser(root)),
+                                          expanded))
+            for root in roots
+        ]
+
+    contained = [rp for rp in candidates if _contained_in_root(rp) is not None]
+    if not contained:
+        raise ToolError(
+            "Path is outside the permitted folder(s) (DOCUMENT_ROOT"
+            + (" / OUTPUT_DIR" if OUTPUT_DIR else "")
+            + ") and was refused."
+        )
+    # Prefer a candidate that already exists (matters when a relative name
+    # could live in either root); else fall back to the first (document-root).
+    for rp in contained:
+        if os.path.isfile(rp):
+            return rp
+    return contained[0]
+
+
+def _iter_docx_files(root):
+    """Yield every .docx file under `root` (recursively), skipping Office lock
+    files like '~$Policy 103.docx'."""
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.lower().endswith(".docx") and not fn.startswith("~$"):
+                yield os.path.join(dirpath, fn)
+
+
+def _all_docx_files():
+    """All .docx files under the permitted roots, de-duplicated, in root order."""
+    seen = set()
+    out = []
+    for root in _permitted_roots():
+        real_root = os.path.realpath(os.path.expanduser(root))
+        if not os.path.isdir(real_root):
+            continue
+        for p in _iter_docx_files(real_root):
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                out.append(rp)
+    return out
+
+
+def _display_path(p):
+    """Path shown to the model: relative to its containing root when possible
+    (so it can be handed straight back to msword_open), else the absolute path."""
+    root = _contained_in_root(p)
+    if root is not None:
+        try:
+            return os.path.relpath(p, root)
+        except ValueError:
+            pass
+    return p
+
+
+def _find_docx_by_name(name):
+    """
+    Full paths under the permitted roots whose FILENAME matches `name`
+    (case-insensitive; a missing '.docx' extension is added). Any directory part
+    of `name` is ignored - this is a last-resort basename lookup so a bare
+    filename opens even when it sits in a subfolder of the document root.
+    """
+    want = os.path.basename(name.strip().replace("\\", "/")).lower()
+    if not want:
+        return []
+    if not want.endswith(".docx"):
+        want += ".docx"
+    return [p for p in _all_docx_files() if os.path.basename(p).lower() == want]
 
 
 def _get_session(args):
@@ -1203,9 +1300,28 @@ def _save_to_kb(doc, source_path):
 # TOOL HANDLERS  (each takes an `args` dict, returns a JSON-serialisable object)
 # =============================================================================
 def tool_open(args):
-    path = _resolve_path(_require(args, "path"))
+    raw = _require(args, "path")
+    path = _resolve_path(raw)
     if not os.path.isfile(path):
-        raise ToolError("File not found: {}".format(path))
+        # Not at the resolved location. Fall back to a basename lookup anywhere
+        # under the permitted roots, so "Policy 103.docx" opens even when it
+        # lives in a subfolder of the document root.
+        matches = _find_docx_by_name(raw)
+        if len(matches) == 1:
+            path = matches[0]
+        elif len(matches) > 1:
+            listing = ", ".join(_display_path(m) for m in matches)
+            raise ToolError(
+                "Several documents are named '{}': {}. Re-open with the path "
+                "(relative to the document root) to pick one.".format(
+                    os.path.basename(raw.replace("\\", "/")), listing)
+            )
+        else:
+            raise ToolError(
+                "File not found: '{}'. Paths are resolved relative to the "
+                "document root; call msword_list_documents to see what is "
+                "available.".format(raw)
+            )
     if not path.lower().endswith(".docx"):
         raise ToolError("Only .docx files are supported (got: {})".format(path))
     if len(SESSIONS) >= MAX_SESSIONS:
@@ -1244,6 +1360,38 @@ def tool_open(args):
             log("knowledge-base save failed: {}".format(e))
             result["knowledge_base_error"] = str(e)
     return result
+
+
+def tool_list_documents(args):
+    """
+    List the .docx files available under the permitted roots (document root, and
+    output folder if configured), so the model can find a file by name instead
+    of guessing its path. Optional 'query' filters by filename substring.
+    """
+    query = (args.get("query") or "").strip().lower()
+    docs = []
+    for p in _all_docx_files():
+        name = os.path.basename(p)
+        if query and query not in name.lower():
+            continue
+        entry = {"name": name, "path": _display_path(p)}
+        try:
+            st = os.stat(p)
+            entry["size_bytes"] = st.st_size
+            entry["modified"] = datetime.datetime.fromtimestamp(
+                st.st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            pass
+        docs.append(entry)
+    docs.sort(key=lambda d: d["name"].lower())
+    return {
+        "count": len(docs),
+        "document_root": DOCUMENT_ROOT,
+        "output_dir": OUTPUT_DIR,
+        "documents": docs,
+        "note": "Open any of these by passing its 'path' (or just its name) to "
+                "msword_open.",
+    }
 
 
 def tool_create(args):
@@ -1842,14 +1990,25 @@ def tool_reject_all_changes(args):
 TOOLS = [
     {
         "name": "msword_open",
-        "description": "Open a .docx file into an in-memory session and return a session_id used by all other tools.",
+        "description": "Open a .docx file into an in-memory session and return a session_id used by all other tools. Just pass the file name (e.g. 'Policy 103.docx') - it is resolved relative to the server's document root, so you do NOT need an absolute path. A relative sub-path ('policies/Policy 103.docx') and absolute/~ paths also work. If a bare name is not at the top level, the server searches the document root's subfolders for it. Use msword_list_documents if you are unsure of the exact name.",
         "handler": tool_open,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Absolute or ~ path to a .docx file."}
+                "path": {"type": "string", "description": "The .docx file name (relative to the document root), a relative sub-path, or an absolute/~ path."}
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "msword_list_documents",
+        "description": "List the .docx files available under the document root (and the output folder, if configured), with each file's path (relative to its root), size and last-modified time. Use this to find a document by name before calling msword_open, instead of guessing paths. Optional 'query' filters the list by filename substring.",
+        "handler": tool_list_documents,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional case-insensitive filename substring filter, e.g. 'policy'."},
+            },
         },
     },
     {
@@ -2311,6 +2470,49 @@ def run_check():
 
         print("[check] round-trip: PASS")
 
+        # --- Open by bare name / relative path + msword_list_documents -------
+        # A file sitting directly in the document root opens by its name alone,
+        # without an absolute path (the bug this fixes: the model should not
+        # have to guess the full path).
+        by_name = tool_open({"path": "roundtrip.docx"})
+        assert os.path.realpath(by_name["path"]) == os.path.realpath(path), \
+            "bare filename did not resolve against the document root"
+        tool_close({"session_id": by_name["session_id"]})
+
+        # A file in a SUBFOLDER opens by bare name via the recursive fallback,
+        # and also by its relative sub-path.
+        subdir = os.path.join(tmpdir, "policies")
+        os.makedirs(subdir, exist_ok=True)
+        sub_doc = os.path.join(subdir, "Policy 103.docx")
+        ds = docx.Document()
+        ds.add_paragraph("Policy 103 body.")
+        ds.save(sub_doc)
+        o_sub = tool_open({"path": "Policy 103.docx"})  # bare name, in a subfolder
+        assert os.path.realpath(o_sub["path"]) == os.path.realpath(sub_doc), \
+            "bare filename did not find the file in a subfolder"
+        tool_close({"session_id": o_sub["session_id"]})
+        o_rel = tool_open({"path": os.path.join("policies", "Policy 103.docx")})
+        assert os.path.realpath(o_rel["path"]) == os.path.realpath(sub_doc), \
+            "relative sub-path did not resolve against the document root"
+        tool_close({"session_id": o_rel["session_id"]})
+
+        # A missing file gives a clear error (not a silent wrong path).
+        try:
+            tool_open({"path": "does-not-exist.docx"})
+            raise AssertionError("expected a not-found error")
+        except ToolError as e:
+            assert "not found" in str(e).lower(), "unexpected open error: {}".format(e)
+
+        # list_documents finds both files and filters by query.
+        listing = tool_list_documents({})
+        names = {d["name"] for d in listing["documents"]}
+        assert {"roundtrip.docx", "Policy 103.docx"} <= names, \
+            "list_documents missing files: {}".format(names)
+        filtered = tool_list_documents({"query": "policy"})
+        assert [d["name"] for d in filtered["documents"]] == ["Policy 103.docx"], \
+            "list_documents query filter wrong: {}".format(filtered["documents"])
+        print("[check] open-by-name / list-documents: PASS")
+
         # --- Tracked changes 1: simple word replace, accept + reject --------
         tpath = os.path.join(tmpdir, "tracked.docx")
         td = docx.Document()
@@ -2652,11 +2854,11 @@ def run_check():
         print("[check] round-trip: FAIL -> {}".format(e))
         traceback.print_exc()
     finally:
-        # Clean up temp files; leave nothing behind.
+        # Clean up temp files; leave nothing behind. rmtree handles the
+        # subfolders the test creates (generated/, kb/, policies/).
         try:
-            for f in os.listdir(tmpdir):
-                os.remove(os.path.join(tmpdir, f))
-            os.rmdir(tmpdir)
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
 
