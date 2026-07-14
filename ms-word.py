@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-msword_mcp.py - A single-file MCP (Model Context Protocol) stdio server that
-gives an AI agent read/search/edit/generate access to Word .docx files.
+ms-word.py (v2.0.0) - A single-file MCP (Model Context Protocol) stdio server
+that gives an AI agent read/search/edit/generate access to Word .docx files.
 
 It follows a simple open -> edit -> save workflow (msword_open ... msword_save),
 with the .docx engine provided by the Python library `python-docx`.
@@ -112,7 +112,7 @@ WHAT IT CANNOT DO
     Run the built-in self-test. It creates a temp .docx, opens/edits/saves/
     reopens it, and prints PASS/FAIL. No arguments, no network, no side files
     left behind:
-        "C:\path\to\python.exe" msword_mcp.py --check
+        "C:\path\to\python.exe" ms-word.py --check
 
     Expected tail of output on success:
         [check] round-trip: PASS
@@ -130,10 +130,10 @@ WHAT IT CANNOT DO
           - name: msword-py
             command: C:\path\to\python.exe
             args:
-              - C:\path\to\msword_mcp.py
+              - C:\path\to\ms-word.py
               - --author
               - Matt
-              - --document-root
+              - --docs-dir
               - C:\Users\me\Documents\ai_docs
               - --output-dir
               - C:\Users\me\Documents\ai_generated
@@ -144,8 +144,8 @@ WHAT IT CANNOT DO
 
     The --author value is stamped on every tracked change. Omit the two --author
     lines to fall back to the TRACKED_CHANGE_AUTHOR config constant below.
-    The --document-root folder is REQUIRED (here, via MSWORD_DOCUMENT_ROOT, or
-    via the DOCUMENT_ROOT constant): all open/save paths must be inside it and
+    The --docs-dir folder is REQUIRED (here, via MSWORD_DOCS_DIR, or
+    via the DOCS_DIR constant): all open/save paths must be inside it and
     the server refuses to start without one.
     The --output-dir folder (optional; MSWORD_OUTPUT_DIR or the OUTPUT_DIR
     constant) is where msword_create writes NEW documents; it is kept SEPARATE
@@ -178,35 +178,39 @@ failed transfer" rule):
       standard, unavoidable trade-off for run-aware replacement.
 """
 
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "2.0.0"
+
 # =============================================================================
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
 # =============================================================================
 SERVER_NAME = "msword-py"          # advertised to the MCP client
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = __version__
 PROTOCOL_VERSION_FALLBACK = "2024-11-05"  # used if the client sends none
 
 # REQUIRED path sandbox. The server refuses to open or save any file outside
 # this directory tree, and REFUSES TO START if no root is configured - the
 # model chooses open/save paths, so an unconfined server could read/write any
-# .docx this account can. Set it here, or at launch with --document-root or
-# the MSWORD_DOCUMENT_ROOT environment variable (which take priority over
+# .docx this account can. Set it here, or at launch with --docs-dir or
+# the MSWORD_DOCS_DIR environment variable (which take priority over
 # this constant). Symlinks are resolved before the containment check.
 # This root is ALSO the base for relative paths: a bare "Policy 103.docx" is
 # resolved against it (not the process CWD), so the model can open a file by
 # name without knowing its absolute path.
-#   e.g. DOCUMENT_ROOT = r"C:\Users\you\Documents\ai_docs"
+#   e.g. DOCS_DIR = r"C:\Users\you\Documents\ai_docs"
 # (--check is exempt: the self-test sandboxes itself to its own temp folder.)
 # Related caution: only open .docx files from trusted sources - a maliciously
 # crafted file could use XML entity tricks to pull local file contents into
 # the document text that the model then reads.
-DOCUMENT_ROOT = None
+DOCS_DIR = None
 
 # OPTIONAL folder where msword_create writes NEW .docx files. Kept SEPARATE from
 # the knowledge-base folder below. Set it here, or at launch with --output-dir
 # or the MSWORD_OUTPUT_DIR environment variable (which take priority over this
 # constant). It is also treated as a permitted open/save location alongside
-# DOCUMENT_ROOT, so freshly created documents can be reopened/edited later. If
-# left unset, msword_create falls back to writing inside DOCUMENT_ROOT.
+# DOCS_DIR, so freshly created documents can be reopened/edited later. If
+# left unset, msword_create falls back to writing inside DOCS_DIR.
 #   e.g. OUTPUT_DIR = r"C:\Users\you\Documents\ai_generated"
 OUTPUT_DIR = None
 
@@ -215,7 +219,7 @@ OUTPUT_DIR = None
 # way confluence.py mirrors pages, so the content can feed a local RAG index.
 # The Markdown files are named 'Word - <name>.md' and overwritten each time.
 # This folder is written to by the server only (the model never chooses the
-# path), so it does not need to sit inside DOCUMENT_ROOT. Set it here, or at
+# path), so it does not need to sit inside DOCS_DIR. Set it here, or at
 # launch with --kb-dir or the MSWORD_KB_DIR environment variable (which take
 # priority over this constant). Leave unset to disable mirroring.
 #   e.g. KB_DIR = r"C:\Users\you\Documents\rag_kb"
@@ -259,6 +263,13 @@ def log(msg):
     except Exception:
         pass
 
+
+# --version must work even when python-docx is not installed yet (useful on
+# an endpoint before the wheels are sideloaded), so answer it before the
+# engine import below can fail.
+if "--version" in sys.argv:
+    print("{0} {1}".format(SERVER_NAME, __version__))
+    sys.exit(0)
 
 # --- Import the engine, failing loudly and specifically on mismatch. --------
 try:
@@ -331,14 +342,14 @@ def _require(args, key):
 
 def _permitted_roots():
     """
-    Folders the server is allowed to open/save inside: the DOCUMENT_ROOT
+    Folders the server is allowed to open/save inside: the DOCS_DIR
     sandbox, plus the OUTPUT_DIR for created documents (when configured and
     distinct). The knowledge-base folder is deliberately NOT included - the
     model never supplies a path into it; the server writes there itself.
     """
     roots = []
-    if DOCUMENT_ROOT:
-        roots.append(DOCUMENT_ROOT)
+    if DOCS_DIR:
+        roots.append(DOCS_DIR)
     if OUTPUT_DIR:
         roots.append(OUTPUT_DIR)
     return roots
@@ -371,7 +382,7 @@ def _resolve_path(path):
     the MCP client launched python and is almost never the document folder, so
     resolving there is what made a bare filename fail the sandbox and forced the
     model to guess absolute paths. When a relative name maps into more than one
-    root, an existing file is preferred; otherwise the document-root candidate
+    root, an existing file is preferred; otherwise the docs-dir candidate
     wins (the natural target for a new save-as).
 
     An ABSOLUTE (or ~) path is taken as-is and must still fall inside a
@@ -383,7 +394,7 @@ def _resolve_path(path):
     roots = _permitted_roots()
     if not roots:
         # main() refuses to start without a root; this guards direct callers.
-        raise ToolError("No DOCUMENT_ROOT is configured; file access is disabled.")
+        raise ToolError("No DOCS_DIR is configured; file access is disabled.")
 
     expanded = os.path.expanduser(path.strip())
     if os.path.isabs(expanded):
@@ -399,12 +410,12 @@ def _resolve_path(path):
     contained = [rp for rp in candidates if _contained_in_root(rp) is not None]
     if not contained:
         raise ToolError(
-            "Path is outside the permitted folder(s) (DOCUMENT_ROOT"
+            "Path is outside the permitted folder(s) (DOCS_DIR"
             + (" / OUTPUT_DIR" if OUTPUT_DIR else "")
             + ") and was refused."
         )
     # Prefer a candidate that already exists (matters when a relative name
-    # could live in either root); else fall back to the first (document-root).
+    # could live in either root); else fall back to the first (the docs dir).
     for rp in contained:
         if os.path.isfile(rp):
             return rp
@@ -1386,7 +1397,7 @@ def tool_list_documents(args):
     docs.sort(key=lambda d: d["name"].lower())
     return {
         "count": len(docs),
-        "document_root": DOCUMENT_ROOT,
+        "docs_dir": DOCS_DIR,
         "output_dir": OUTPUT_DIR,
         "documents": docs,
         "note": "Open any of these by passing its 'path' (or just its name) to "
@@ -1412,11 +1423,11 @@ def tool_create(args):
     if not name.lower().endswith(".docx"):
         name += ".docx"
 
-    out_dir = OUTPUT_DIR or DOCUMENT_ROOT
+    out_dir = OUTPUT_DIR or DOCS_DIR
     if not out_dir:
         raise ToolError(
             "No output folder configured. Set --output-dir (or "
-            "MSWORD_OUTPUT_DIR), or --document-root."
+            "MSWORD_OUTPUT_DIR), or --docs-dir."
         )
 
     try:
@@ -2373,9 +2384,9 @@ def serve():
     log("interpreter: {}".format(sys.executable))
     log("python-docx {} / lxml {}".format(docx_ver, lxml_ver))
     log("tracked-change author: {}".format(AUTHOR))
-    if DOCUMENT_ROOT:
-        log("path sandbox DOCUMENT_ROOT = {}".format(DOCUMENT_ROOT))
-    log("new-document output folder = {}".format(OUTPUT_DIR or DOCUMENT_ROOT))
+    if DOCS_DIR:
+        log("path sandbox DOCS_DIR = {}".format(DOCS_DIR))
+    log("new-document output folder = {}".format(OUTPUT_DIR or DOCS_DIR))
     if KB_DIR:
         log("knowledge-base mirroring enabled -> {}".format(KB_DIR))
     else:
@@ -2411,7 +2422,7 @@ def serve():
 # =============================================================================
 def run_check():
     import tempfile
-    global DOCUMENT_ROOT, OUTPUT_DIR, KB_DIR
+    global DOCS_DIR, OUTPUT_DIR, KB_DIR
     docx_ver, lxml_ver = _versions()
     print("[check] interpreter : {}".format(sys.executable))
     print("[check] python-docx : {}".format(docx_ver))
@@ -2419,8 +2430,8 @@ def run_check():
 
     tmpdir = tempfile.mkdtemp(prefix="msword_check_")
     # The self-test sandboxes itself to its own temp folder so it can run
-    # before the endpoint's real DOCUMENT_ROOT exists.
-    DOCUMENT_ROOT = tmpdir
+    # before the endpoint's real DOCS_DIR exists.
+    DOCS_DIR = tmpdir
     print("[check] sandbox     : {} (self-test only)".format(tmpdir))
     path = os.path.join(tmpdir, "roundtrip.docx")
     ok = True
@@ -2879,16 +2890,20 @@ def main():
         help="Run an offline open/edit/save/reopen self-test and exit."
     )
     parser.add_argument(
+        "--version", action="version",
+        version="{0} {1}".format(SERVER_NAME, __version__)
+    )
+    parser.add_argument(
         "--author", default=os.environ.get("MSWORD_AUTHOR"), metavar="NAME",
         help="Author name stamped on tracked changes (falls back to the "
              "MSWORD_AUTHOR environment variable, then the "
              "TRACKED_CHANGE_AUTHOR config value)."
     )
     parser.add_argument(
-        "--document-root", default=os.environ.get("MSWORD_DOCUMENT_ROOT"),
+        "--docs-dir", default=os.environ.get("MSWORD_DOCS_DIR"),
         metavar="DIR",
-        help="REQUIRED path sandbox (unless the DOCUMENT_ROOT config constant "
-             "is set, or via the MSWORD_DOCUMENT_ROOT environment variable): "
+        help="REQUIRED path sandbox (unless the DOCS_DIR config constant "
+             "is set, or via the MSWORD_DOCS_DIR environment variable): "
              "the server refuses to open or save any file outside this "
              "directory tree, and refuses to start without one. The model "
              "chooses open/save paths, so an unconfined server could "
@@ -2913,11 +2928,11 @@ def main():
     )
     args = parser.parse_args()
 
-    global AUTHOR, DOCUMENT_ROOT, OUTPUT_DIR, KB_DIR
+    global AUTHOR, DOCS_DIR, OUTPUT_DIR, KB_DIR
     if args.author:
         AUTHOR = args.author
-    if args.document_root:
-        DOCUMENT_ROOT = args.document_root
+    if args.docs_dir:
+        DOCS_DIR = args.docs_dir
     if args.output_dir:
         OUTPUT_DIR = args.output_dir
     if args.kb_dir:
@@ -2926,16 +2941,16 @@ def main():
     if args.check:
         sys.exit(run_check())
 
-    # File access is confined to DOCUMENT_ROOT, so a root is mandatory.
-    if not DOCUMENT_ROOT:
-        log("FATAL: no document root configured. Pass --document-root, set the "
-            "MSWORD_DOCUMENT_ROOT environment variable, or set the "
-            "DOCUMENT_ROOT constant in this file. The server only opens/saves "
+    # File access is confined to DOCS_DIR, so a root is mandatory.
+    if not DOCS_DIR:
+        log("FATAL: no document root configured. Pass --docs-dir, set the "
+            "MSWORD_DOCS_DIR environment variable, or set the "
+            "DOCS_DIR constant in this file. The server only opens/saves "
             ".docx files inside that folder and will not start without one.")
         sys.exit(2)
-    if not os.path.isdir(DOCUMENT_ROOT):
+    if not os.path.isdir(DOCS_DIR):
         log("FATAL: the configured document root does not exist or is not a "
-            "directory: {}".format(DOCUMENT_ROOT))
+            "directory: {}".format(DOCS_DIR))
         sys.exit(2)
 
     try:

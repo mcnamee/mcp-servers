@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-jira.py - A single-file, READ-ONLY MCP (Model Context Protocol) server for
-querying Jira Data Center (v2 REST API) using only the Python 3 standard
-library.
+jira.py (v1.1.0) - A single-file, READ-ONLY MCP (Model Context Protocol)
+server for querying Jira Data Center (v2 REST API) using only the Python 3
+standard library.
 
 It speaks MCP over stdio (newline-delimited JSON-RPC 2.0), which is what the
 Continue VSCode extension launches for a `type: stdio` server. No third-party
@@ -105,6 +105,10 @@ failed transfer" rule):
     before relying on it.
 """
 
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "1.1.0"
+
 import argparse
 import base64
 import json
@@ -117,7 +121,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "jira-mcp"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = __version__
 # Protocol version we default to if the client does not send one. We echo the
 # client's requested version when possible (see handle_initialize).
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
@@ -932,6 +936,8 @@ def build_arg_parser():
                    help="Connect to Jira, print who you are authenticated as "
                         "and how many projects are visible (to stderr), then "
                         "exit (no server).")
+    p.add_argument("--version", action="version",
+                   version="{0} {1}".format(SERVER_NAME, __version__))
     return p
 
 

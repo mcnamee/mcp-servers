@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 r"""
-pdf-to-md.py - Self-contained MCP (Model Context Protocol) stdio server for
-Continue that converts PDFs in a folder to Markdown, including tables (both
-bordered and borderless).
+pdf-to-md.py (v4.0.0) - Self-contained MCP (Model Context Protocol) stdio
+server for Continue / Cline that converts PDFs in a folder to Markdown,
+including tables (both bordered and borderless).
 
 =============================================================================
  DEPENDENCIES
@@ -43,7 +43,7 @@ Notes:
       "command": "python",
       "args": [
         "C:\\path\\to\\pdf-to-md.py",
-        "--input-dir",  "C:\\Reference\\PDFs",
+        "--docs-dir",  "C:\\Reference\\PDFs",
         "--output-dir", "C:\\Reference\\Markdown"
       ],
       "env": { "PYTHONUTF8": "1" }
@@ -71,7 +71,7 @@ echo with nested JSON, which silently drops the "arguments" object):
     {"jsonrpc":"2.0","id":2,"method":"tools/list"}
     {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"convert_all_pdfs","arguments":{}}}
     '@
-    $msgs | python C:\path\to\pdf-to-md.py --input-dir "C:\Reference\PDFs" --output-dir "C:\Reference\Markdown"
+    $msgs | python C:\path\to\pdf-to-md.py --docs-dir "C:\Reference\PDFs" --output-dir "C:\Reference\Markdown"
 
 Expected: three JSON lines on stdout (initialize result, tool list, conversion
 summary). Diagnostics appear on stderr and never on stdout.
@@ -118,6 +118,10 @@ A quick Python conversion check (no MCP) can be done with:
   * Outgoing JSON uses ensure_ascii=True, so the stdout stream stays pure
     ASCII regardless of document content.
 """
+
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "4.0.0"
 
 import argparse
 import contextlib
@@ -173,7 +177,7 @@ if IMPORT_ERROR is None:
 # Configuration constants
 # --------------------------------------------------------------------------
 SERVER_NAME = "pdf2md-mcp"
-SERVER_VERSION = "3.2.0"
+SERVER_VERSION = __version__
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 
 # Table detection strategy passed to pymupdf4llm. "lines_strict" is the
@@ -354,10 +358,10 @@ def find_pdfs(folder, recursive):
     return sorted(out)
 
 
-def md_output_path(pdf_path, input_dir, output_dir):
+def md_output_path(pdf_path, docs_dir, output_dir):
     """Map an input PDF to its .md path in the output folder, preserving any
     sub-folder structure (relevant when --recursive is used)."""
-    rel = Path(pdf_path).resolve().relative_to(Path(input_dir).resolve())
+    rel = Path(pdf_path).resolve().relative_to(Path(docs_dir).resolve())
     return Path(output_dir) / rel.with_suffix(".md")
 
 
@@ -408,24 +412,24 @@ def match_pdfs(query, pdfs):
 # --------------------------------------------------------------------------
 def do_convert_all(config, force=False):
     """Batch convert. Returns (text, is_error)."""
-    input_dir = config["input_dir"]
+    docs_dir = config["docs_dir"]
     output_dir = config["output_dir"]
     recursive = config["recursive"]
 
-    if not os.path.isdir(input_dir):
-        return ("Configured input folder does not exist: {}".format(input_dir), True)
+    if not os.path.isdir(docs_dir):
+        return ("Configured input folder does not exist: {}".format(docs_dir), True)
 
     try:
-        pdfs = find_pdfs(input_dir, recursive)
+        pdfs = find_pdfs(docs_dir, recursive)
     except OSError as exc:
-        return ("Could not read input folder {}: {}".format(input_dir, exc), True)
+        return ("Could not read input folder {}: {}".format(docs_dir, exc), True)
 
     if not pdfs:
-        return ("No PDF files found in {}.".format(input_dir), True)
+        return ("No PDF files found in {}.".format(docs_dir), True)
 
     converted, skipped, failed = [], [], []
     for pdf in pdfs:
-        out_path = md_output_path(pdf, input_dir, output_dir)
+        out_path = md_output_path(pdf, docs_dir, output_dir)
         if out_path.exists() and not force:
             skipped.append(pdf.name)
             continue
@@ -441,7 +445,7 @@ def do_convert_all(config, force=False):
         converted.append(pdf.name)
 
     parts = [
-        "Batch conversion of {} PDF(s) in {}".format(len(pdfs), input_dir),
+        "Batch conversion of {} PDF(s) in {}".format(len(pdfs), docs_dir),
         "Output folder: {}".format(output_dir),
         "",
         "Converted: {}".format(len(converted)),
@@ -463,20 +467,20 @@ def do_convert_all(config, force=False):
 
 def do_convert_one_fuzzy(query, config):
     """Single fuzzy convert. Returns (text, is_error)."""
-    input_dir = config["input_dir"]
+    docs_dir = config["docs_dir"]
     output_dir = config["output_dir"]
     recursive = config["recursive"]
 
-    if not os.path.isdir(input_dir):
-        return ("Configured input folder does not exist: {}".format(input_dir), True)
+    if not os.path.isdir(docs_dir):
+        return ("Configured input folder does not exist: {}".format(docs_dir), True)
 
     try:
-        pdfs = find_pdfs(input_dir, recursive)
+        pdfs = find_pdfs(docs_dir, recursive)
     except OSError as exc:
-        return ("Could not read input folder {}: {}".format(input_dir, exc), True)
+        return ("Could not read input folder {}: {}".format(docs_dir, exc), True)
 
     if not pdfs:
-        return ("No PDF files found in {}.".format(input_dir), True)
+        return ("No PDF files found in {}.".format(docs_dir), True)
 
     ranked = match_pdfs(query, pdfs)
     best_path, (best_contained, best_ratio) = ranked[0]
@@ -484,7 +488,7 @@ def do_convert_one_fuzzy(query, config):
     if best_contained == 0.0 and best_ratio < MIN_RATIO:
         return (
             "No PDF closely matching '{}' was found in {}.\nAvailable PDFs:\n{}".format(
-                query, input_dir, format_file_list(pdfs)
+                query, docs_dir, format_file_list(pdfs)
             ),
             True,
         )
@@ -507,7 +511,7 @@ def do_convert_one_fuzzy(query, config):
     if not ok:
         return ("Failed to convert '{}': {}".format(best_path.name, err), True)
 
-    out_path = md_output_path(best_path, input_dir, output_dir)
+    out_path = md_output_path(best_path, docs_dir, output_dir)
     try:
         write_markdown(markdown, out_path)
     except OSError as exc:
@@ -662,10 +666,10 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="Self-contained MCP stdio server: convert PDFs in a folder to Markdown (with tables)."
     )
-    parser.add_argument("--input-dir",
-                        default=os.environ.get("PDF2MD_INPUT_DIR"),
+    parser.add_argument("--docs-dir",
+                        default=os.environ.get("PDF2MD_DOCS_DIR"),
                         help="Folder containing the source PDFs. Falls back to "
-                             "the PDF2MD_INPUT_DIR environment variable.")
+                             "the PDF2MD_DOCS_DIR environment variable.")
     parser.add_argument("--output-dir",
                         default=os.environ.get("PDF2MD_OUTPUT_DIR"),
                         help="Folder to write .md files into. Falls back to "
@@ -675,21 +679,53 @@ def parse_args(argv):
         action="store_true",
         default=(os.environ.get("PDF2MD_RECURSIVE", "").strip().lower()
                  in ("1", "true", "yes", "on")),
-        help="Search sub-folders of --input-dir (sub-folder structure is "
+        help="Search sub-folders of --docs-dir (sub-folder structure is "
              "mirrored in the output). Also via PDF2MD_RECURSIVE=1.",
     )
+    parser.add_argument("--check", action="store_true",
+                        help="Print environment/config diagnostics (interpreter, "
+                             "folders, dependency status, PDFs found), then exit "
+                             "without starting the server.")
+    parser.add_argument("--version", action="version",
+                        version="{0} {1}".format(SERVER_NAME, __version__))
     args = parser.parse_args(argv)
-    missing = [name for name, value in
-               (("--input-dir / PDF2MD_INPUT_DIR", args.input_dir),
-                ("--output-dir / PDF2MD_OUTPUT_DIR", args.output_dir))
-               if not value]
-    if missing:
-        parser.error("missing required setting(s): " + ", ".join(missing))
+    if not args.check:
+        missing = [name for name, value in
+                   (("--docs-dir / PDF2MD_DOCS_DIR", args.docs_dir),
+                    ("--output-dir / PDF2MD_OUTPUT_DIR", args.output_dir))
+                   if not value]
+        if missing:
+            parser.error("missing required setting(s): " + ", ".join(missing))
     return args
+
+
+def run_check(args):
+    """--check: report interpreter, config and dependency state, then exit."""
+    print("{0} environment check".format(SERVER_NAME))
+    print("  version           : {0}".format(__version__))
+    print("  python executable : {0}".format(sys.executable))
+    print("  python version    : {0}".format(sys.version.split()[0]))
+    print("  docs dir          : {0}".format(args.docs_dir or "(NOT SET - required)"))
+    print("  docs dir exists   : {0}".format(bool(args.docs_dir) and os.path.isdir(args.docs_dir)))
+    print("  output dir        : {0}".format(args.output_dir or "(NOT SET - required)"))
+    print("  output dir exists : {0}".format(bool(args.output_dir) and os.path.isdir(args.output_dir)))
+    print("  recursive         : {0}".format(args.recursive))
+    print("  dependencies      : {0}".format(
+        "OK (pymupdf + pymupdf4llm importable)" if IMPORT_ERROR is None else IMPORT_ERROR))
+    if args.docs_dir and os.path.isdir(args.docs_dir):
+        try:
+            pdfs = find_pdfs(args.docs_dir, args.recursive)
+            print("  PDFs found        : {0}".format(len(pdfs)))
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            print("  PDFs found        : error listing ({0})".format(exc))
+    return 0
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.check:
+        return run_check(args)
 
     # Reserve stdout strictly for JSON-RPC; newline='\n' stops Windows CRLF
     # rewriting that would corrupt the line-delimited protocol.
@@ -700,13 +736,13 @@ def main(argv=None):
         pass
 
     config = {
-        "input_dir": args.input_dir,
+        "docs_dir": args.docs_dir,
         "output_dir": args.output_dir,
         "recursive": args.recursive,
     }
     log("interpreter (sys.executable): {}".format(sys.executable))
-    log("started (input_dir={!r}, output_dir={!r}, recursive={})".format(
-        args.input_dir, args.output_dir, args.recursive))
+    log("started (docs_dir={!r}, output_dir={!r}, recursive={})".format(
+        args.docs_dir, args.output_dir, args.recursive))
     if fitz is None or pymupdf4llm is None:
         log("WARNING: {}".format(IMPORT_ERROR))
         log("WARNING: the package is missing from the interpreter above. "

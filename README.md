@@ -3,21 +3,26 @@ My MCP Servers for Productivity
 
 Each file in this repo is a single-file, stdio-transport MCP server. Most of
 them are standard-library only; a few need one extra pip package. Install
-into the SAME Python interpreter that your MCP client (e.g. Continue) will
-launch the server with.
+into the SAME Python interpreter that your MCP client (e.g. Continue or
+Cline) will launch the server with.
 
-## Dependencies per server
+## Servers and dependencies
 
-| Server | pip install | Notes |
-|---|---|---|
-| `confluence.py` | _none_ | standard library only |
-| `jira.py` | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
-| `knowledge-base.py` | _none_ | standard library only (keyword search) |
-| `knowledge-base-rag.py` | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
-| `ms-excel.py` | _none_ | standard library only (parses .xlsx as a zip of XML) |
-| `ms-word.py` | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
-| `ms-outlook.py` | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
-| `pdf-to-md.py` | `pip install pymupdf pymupdf4llm` | OCR of scanned PDFs additionally requires Tesseract installed on the machine (not a pip package) |
+Every server carries a semantic version in a `__version__` constant at the
+top of the file (also printed by `--version` and reported to the MCP client
+in `serverInfo`). The version is bumped on every change — see `CLAUDE.md`
+for the bump rules.
+
+| Server | Version | pip install | Notes |
+|---|---|---|---|
+| `confluence.py` | 1.3.0 | _none_ | standard library only |
+| `jira.py` | 1.1.0 | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
+| `knowledge-base.py` | 2.0.0 | _none_ | standard library only (keyword search) |
+| `knowledge-base-rag.py` | 1.2.1 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
+| `ms-excel.py` | 2.0.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
+| `ms-word.py` | 2.0.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
+| `ms-outlook.py` | 1.5.1 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
+| `pdf-to-md.py` | 4.0.0 | `pip install pymupdf pymupdf4llm` | OCR of scanned PDFs additionally requires Tesseract installed on the machine (not a pip package) |
 
 ## Install everything at once
 
@@ -27,6 +32,50 @@ pip install python-docx pymupdf pymupdf4llm pywin32 chromadb
 
 (Drop `pywin32` if you're not on Windows / not using `ms-outlook.py`.)
 
+## Configuration conventions (all servers)
+
+Every server follows the same configuration pattern, so once you know one
+you know them all:
+
+1. **Precedence: CLI flag > environment variable > constant in the file.**
+   Every non-secret setting can be supplied three ways; the flag always wins,
+   then the env var, then the (optional) constant in the file's CONFIG block.
+2. **Naming: the env var is the server's prefix + the flag name.**
+   `--docs-dir` on `ms-excel.py` is `EXCEL_DOCS_DIR`; on `ms-word.py` it is
+   `MSWORD_DOCS_DIR`; `--timeout` on `jira.py` is `JIRA_TIMEOUT`. Prefixes:
+   `CONFLUENCE_`, `JIRA_`, `KB_` (both knowledge-base servers), `EXCEL_`,
+   `OUTLOOK_`, `MSWORD_`, `PDF2MD_`. The one deliberate exception:
+   `--insecure` pairs with `<PREFIX>_VERIFY_SSL=false`.
+3. **Secrets are env-var ONLY.** There are deliberately no
+   `--token`/`--password`/`--*-api-key` flags anywhere, because command-line
+   arguments are visible to other local users in process listings. Put
+   credentials in the `env:` block of your MCP client config.
+4. **Common flag vocabulary across the suite:**
+   - `--docs-dir` — the folder of source documents the server is confined to
+     (workbooks for Excel, .docx sandbox for Word, PDFs for pdf-to-md,
+     markdown/text for the knowledge-base servers)
+   - `--output-dir` — folder generated files are written to (`ms-word.py`,
+     `pdf-to-md.py`)
+   - `--kb-dir` — optional folder where read content is mirrored as Markdown
+     for a local RAG knowledge base (`confluence.py`, `ms-outlook.py`,
+     `ms-word.py`)
+   - `--base-url`, `--ca-cert`, `--insecure`, `--timeout`, `--max-body` —
+     the HTTP servers (`confluence.py`, `jira.py`, `knowledge-base-rag.py`)
+   - `--check` — validate config/environment (and connectivity, for the HTTP
+     servers) and exit without starting the server; run it first, before
+     wiring a server into your MCP client
+   - `--version` — print the server's name and semantic version, then exit
+     (works even when the server's pip dependencies are missing)
+
+> **Upgrading from an older checkout?** These names were standardized in the
+> v2.x/v4.x bumps: `ms-excel.py --folder`/`EXCEL_WORKBOOK_FOLDER` became
+> `--docs-dir`/`EXCEL_DOCS_DIR`, `ms-word.py --document-root`/
+> `MSWORD_DOCUMENT_ROOT` became `--docs-dir`/`MSWORD_DOCS_DIR`,
+> `pdf-to-md.py --input-dir`/`PDF2MD_INPUT_DIR` became
+> `--docs-dir`/`PDF2MD_DOCS_DIR`, and `knowledge-base.py`'s
+> `REFERENCE_DOCS_DIR` became `KB_DOCS_DIR`. Update your client config when
+> you update the file.
+
 ## File access policy
 
 Every server that touches the filesystem is confined to the folder(s) named
@@ -35,11 +84,11 @@ refuse to start unconfined rather than fall back to "anywhere":
 
 | Server | Confined to | Required setting |
 |---|---|---|
-| `ms-word.py` | open/save only inside the document root (and the output folder, if set); new docs written to the output folder; Markdown mirrored to the knowledge-base folder | `--document-root` / `MSWORD_DOCUMENT_ROOT` / `DOCUMENT_ROOT` constant (required); optional `--output-dir` and `--kb-dir` |
-| `ms-excel.py` | reads only inside the workbook folder | `--folder` / `EXCEL_WORKBOOK_FOLDER` / `WORKBOOK_FOLDER` constant |
-| `knowledge-base.py` | reads only inside the docs folder | `--docs-dir` / `REFERENCE_DOCS_DIR` |
+| `ms-word.py` | open/save only inside the docs folder (and the output folder, if set); new docs written to the output folder; Markdown mirrored to the knowledge-base folder | `--docs-dir` / `MSWORD_DOCS_DIR` / `DOCS_DIR` constant (required); optional `--output-dir` and `--kb-dir` |
+| `ms-excel.py` | reads only inside the workbook folder | `--docs-dir` / `EXCEL_DOCS_DIR` / `DOCS_DIR` constant |
+| `knowledge-base.py` | reads only inside the docs folder | `--docs-dir` / `KB_DOCS_DIR` |
 | `knowledge-base-rag.py` | reads only inside the docs folder; writes only the vector-index folder (default `<docs-dir>\.kb-rag-index`); network only to the endpoint(s) you configure | `--docs-dir` / `KB_DOCS_DIR` + `--embed-url` / `KB_EMBED_URL` |
-| `pdf-to-md.py` | reads only the input folder, writes only the output folder | `--input-dir` + `--output-dir` (or `PDF2MD_INPUT_DIR`/`PDF2MD_OUTPUT_DIR`) |
+| `pdf-to-md.py` | reads only the docs folder, writes only the output folder | `--docs-dir` + `--output-dir` (or `PDF2MD_DOCS_DIR`/`PDF2MD_OUTPUT_DIR`) |
 | `confluence.py` | no local file access unless `CONFLUENCE_KB_DIR` is set; then writes only inside that folder | n/a (mirroring is optional; unset = no file access) |
 | `jira.py` | no local file access (HTTP GET to Jira only; reads the optional `JIRA_CA_CERT` bundle once at startup) | n/a |
 | `ms-outlook.py` | no local file access unless `--kb-dir` (`OUTLOOK_KB_DIR`) is set; then writes only inside that folder (reads the optional `--blacklist-file` once at startup) | n/a (mirroring is optional; unset = no file access) |
@@ -71,6 +120,10 @@ stdio JSON stream. After editing `config.yaml`, use VSCode's
 "Developer: Reload Window" rather than toggling the server, to avoid a
 known "already connected to transport" reconnection bug.
 
+Cline users: the flag tables in the per-server sections below apply
+unchanged — see [Installation into Cline](#installation-into-cline-cline_mcp_settingsjson)
+for the JSON equivalent of each YAML example.
+
 ### confluence.py
 
 Configuration is via environment variables (non-secret settings also have
@@ -90,6 +143,8 @@ process listings.
 | `CONFLUENCE_TIMEOUT` | `--timeout` | Request timeout in seconds (default 30) |
 | `CONFLUENCE_MAX_BODY` | `--max-body` | Truncate page bodies to N chars, 0 = unlimited (default). Applies only to text returned to the model, not to files saved via `CONFLUENCE_KB_DIR` |
 | `CONFLUENCE_KB_DIR` | `--kb-dir` | If set, every page read is also saved as a Markdown file (`Confluence - <title>.md`, overwritten each time) into this folder — handy for feeding a local RAG knowledge base, e.g. alongside `knowledge-base.py` |
+| — | `--check` | Connect to Confluence, print who you are authenticated as + visible space count to stderr, then exit (no server) |
+| — | `--version` | Print version and exit |
 
 ```yaml
 mcpServers:
@@ -126,6 +181,7 @@ deletes anything. Like `confluence.py`, **credentials are env-var only** (no
 | `JIRA_TIMEOUT` | `--timeout` | Request timeout in seconds (default 30) |
 | `JIRA_MAX_BODY` | `--max-body` | Truncate issue descriptions to N chars, 0 = unlimited (default) |
 | — | `--check` | Connect to Jira, print who you are authenticated as + visible project count to stderr, then exit (no server) |
+| — | `--version` | Print version and exit |
 
 ```yaml
 mcpServers:
@@ -147,7 +203,7 @@ mcpServers:
 
 | CLI flag | Purpose |
 |---|---|
-| `--docs-dir` | Folder of reference docs to expose (`.md`/`.markdown`/`.txt`), searched recursively. Falls back to `REFERENCE_DOCS_DIR` env var |
+| `--docs-dir` | Folder of reference docs to expose (`.md`/`.markdown`/`.txt`), searched recursively. Falls back to the `KB_DOCS_DIR` env var (deliberately shared with `knowledge-base-rag.py` — set env per server entry if the two should use different folders) |
 | `--check` | List the folder's documents to stderr, then exit (no server) |
 | `--version` | Print version and exit |
 
@@ -261,9 +317,10 @@ mcpServers:
 
 | CLI flag | Purpose |
 |---|---|
-| `--folder` | **Required.** Folder of `.xlsx`/`.xlsm` workbooks to expose — the server only reads files inside it and refuses to start without one. Falls back to the `EXCEL_WORKBOOK_FOLDER` env var, then the `WORKBOOK_FOLDER` constant in the file |
+| `--docs-dir` | **Required.** Folder of `.xlsx`/`.xlsm` workbooks to expose — the server only reads files inside it and refuses to start without one. Falls back to the `EXCEL_DOCS_DIR` env var, then the `DOCS_DIR` constant in the file |
 | `--check` | Print environment/config diagnostics and exit (no server) |
 | `--list` | List readable workbooks in the folder and exit (no server) |
+| `--version` | Print version and exit |
 
 ```yaml
 mcpServers:
@@ -271,7 +328,7 @@ mcpServers:
     command: C:\path\to\python.exe
     args:
       - C:\path\to\ms-excel.py
-      - --folder
+      - --docs-dir
       - C:\path\to\your\workbooks
     env:
       PYTHONUTF8: "1"
@@ -336,13 +393,14 @@ read emails land alongside your Confluence pages and Word documents.
 |---|---|
 | `--check` | Run an offline open/edit/save/reopen self-test and exit (no server) |
 | `--author` | Author name stamped on Word tracked changes. Falls back to the `MSWORD_AUTHOR` env var, then the `TRACKED_CHANGE_AUTHOR` config value in the file. Can also be overridden per-call via the `author` argument on the editing tools (`msword_replace_text`, `msword_set_paragraph_text`, `msword_insert_paragraph`, `msword_delete_paragraph`) |
-| `--document-root` | **Required.** Path sandbox: every open/save must be inside this directory tree, and the server refuses to start without one (`--check` is exempt — the self-test sandboxes itself to its own temp folder). Falls back to the `MSWORD_DOCUMENT_ROOT` env var, then the `DOCUMENT_ROOT` config value. This is the only write-capable server in the suite, and the model chooses the open/save paths |
+| `--docs-dir` | **Required.** Path sandbox: every open/save must be inside this directory tree, and the server refuses to start without one (`--check` is exempt — the self-test sandboxes itself to its own temp folder). Falls back to the `MSWORD_DOCS_DIR` env var, then the `DOCS_DIR` config value. This is the only write-capable server in the suite, and the model chooses the open/save paths |
+| `--version` | Print version and exit |
 | `--output-dir` | Optional folder where `msword_create` writes **new** `.docx` files, kept **separate** from the knowledge-base folder. Falls back to the `MSWORD_OUTPUT_DIR` env var, then the `OUTPUT_DIR` config value, and finally to the document root. Also treated as a permitted open/save location so created documents can be reopened and edited |
 | `--kb-dir` | Optional. If set, **every document opened** with `msword_open` is *also* written out as a Markdown file into this folder for a local RAG knowledge base (like `confluence.py`'s `--kb-dir`). Falls back to the `MSWORD_KB_DIR` env var, then the `KB_DIR` config value. Files are named `Word - <name>.md` and overwritten each open; the folder is created if missing. Omit to disable mirroring |
 
 **Finding documents by name.** You don't need absolute paths. `msword_open`
 resolves a relative path against the **document root**, so *"edit Policy
-103.docx"* opens `<document-root>\Policy 103.docx` directly — a bare filename is
+103.docx"* opens `<docs-dir>\Policy 103.docx` directly — a bare filename is
 even located if it sits in a subfolder of the root. Previously a relative name
 resolved against the server's working directory (wherever the client launched
 Python), so it fell outside the sandbox and the model had to guess the full
@@ -381,7 +439,7 @@ mcpServers:
       - C:\path\to\ms-word.py
       - --author
       - Matt
-      - --document-root
+      - --docs-dir
       - C:\Users\me\Documents\ai_docs
       - --output-dir
       - C:\Users\me\Documents\ai_generated
@@ -398,9 +456,11 @@ documents in the document root and disable Markdown mirroring.
 
 | CLI flag | Purpose |
 |---|---|
-| `--input-dir` | **Required.** Folder containing the source PDFs. Falls back to the `PDF2MD_INPUT_DIR` env var |
+| `--docs-dir` | **Required.** Folder containing the source PDFs. Falls back to the `PDF2MD_DOCS_DIR` env var |
 | `--output-dir` | **Required.** Folder to write `.md` files into. Falls back to the `PDF2MD_OUTPUT_DIR` env var |
-| `--recursive` | Also search sub-folders of `--input-dir` (sub-folder structure is mirrored in the output). Also via `PDF2MD_RECURSIVE=1` |
+| `--recursive` | Also search sub-folders of `--docs-dir` (sub-folder structure is mirrored in the output). Also via `PDF2MD_RECURSIVE=1` |
+| `--check` | Print environment/config diagnostics (folders, dependency status, PDFs found) and exit (no server) |
+| `--version` | Print version and exit |
 
 ```yaml
 mcpServers:
@@ -408,7 +468,7 @@ mcpServers:
     command: C:\path\to\python.exe
     args:
       - C:\path\to\pdf-to-md.py
-      - --input-dir
+      - --docs-dir
       - C:\Reference\PDFs
       - --output-dir
       - C:\Reference\Markdown
@@ -416,6 +476,142 @@ mcpServers:
     env:
       PYTHONUTF8: "1"
 ```
+
+## Installation into Cline (cline_mcp_settings.json)
+
+Cline (and Roo Code, which uses the same format) configures MCP servers in a
+JSON file instead of Continue's YAML. Open it via the Cline pane → **MCP
+Servers** → **Installed** → **Configure MCP Servers**, which edits:
+
+```
+%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json
+```
+
+The mapping from the Continue examples above is mechanical — same `command`,
+`args` and `env`, just as JSON (remember to **double the backslashes** in
+JSON paths). The flag tables in the per-server sections apply unchanged.
+A complete example with every server in this repo (drop the entries you
+don't use, and adjust paths):
+
+```json
+{
+  "mcpServers": {
+    "confluence": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\confluence.py",
+        "--max-body", "20000",
+        "--kb-dir", "C:\\reference-docs\\confluence"
+      ],
+      "env": {
+        "CONFLUENCE_BASE_URL": "https://confluence.internal.example.com",
+        "CONFLUENCE_TOKEN": "your-personal-access-token",
+        "PYTHONUTF8": "1"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "jira": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": ["C:\\path\\to\\jira.py"],
+      "env": {
+        "JIRA_BASE_URL": "https://jira.internal.example.com",
+        "JIRA_TOKEN": "your-personal-access-token",
+        "JIRA_PROJECTS": "ABC,DEF",
+        "PYTHONUTF8": "1"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "reference": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\knowledge-base.py",
+        "--docs-dir", "C:\\reference-docs"
+      ],
+      "env": { "PYTHONUTF8": "1" },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "kb-rag": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\knowledge-base-rag.py",
+        "--docs-dir", "C:\\Users\\me\\knowledge-base",
+        "--embed-url", "https://ai-gateway.internal.example.com/v1/embeddings",
+        "--embed-model", "text-embedding-3-small"
+      ],
+      "env": {
+        "KB_EMBED_API_KEY": "your-api-key",
+        "PYTHONUTF8": "1"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "excel": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\ms-excel.py",
+        "--docs-dir", "C:\\path\\to\\your\\workbooks"
+      ],
+      "env": { "PYTHONUTF8": "1" },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "outlook": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\ms-outlook.py",
+        "--blacklist-file", "C:\\config\\outlook-blacklist.txt",
+        "--search-folders", "Inbox,Sent Items,Archive",
+        "--kb-dir", "C:\\reference-docs\\outlook"
+      ],
+      "env": { "PYTHONUTF8": "1" },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "msword-py": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\ms-word.py",
+        "--author", "Matt",
+        "--docs-dir", "C:\\Users\\me\\Documents\\ai_docs",
+        "--output-dir", "C:\\Users\\me\\Documents\\ai_generated",
+        "--kb-dir", "C:\\Users\\me\\Documents\\rag_kb"
+      ],
+      "env": { "PYTHONUTF8": "1" },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "pdf2md": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": [
+        "C:\\path\\to\\pdf-to-md.py",
+        "--docs-dir", "C:\\Reference\\PDFs",
+        "--output-dir", "C:\\Reference\\Markdown",
+        "--recursive"
+      ],
+      "env": { "PYTHONUTF8": "1" },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+Cline notes:
+
+- `"disabled": false` / `"autoApprove": []` are Cline-specific fields —
+  list tool names in `autoApprove` (e.g. `"excel_read_range"`) to skip the
+  per-call approval prompt for read-only tools you trust.
+- Credentials stay in the `env` block, same as Continue — the settings file
+  is local to your profile, and secrets never appear in process listings.
+- After editing the file, Cline reloads servers automatically; if a server
+  shows as errored, use "Developer: Reload Window" and check the server's
+  stderr output in the MCP pane (every server logs its config problems
+  there — or run the same command with `--check` in a terminal first).
+- The per-MCP skills in the [`skills/`](skills/) folder can be used as Cline
+  workflows for slash commands — see [Skills](#skills-slash-commands-for-each-mcp) below.
 
 ## Usage examples
 
@@ -505,3 +701,55 @@ one or more of the tools the server exposes.
 2. "Convert just the 'procurement policy' PDF to Markdown." → `convert_pdf_to_markdown`
 3. "Reconvert all PDFs to Markdown even though some already have a .md file, since the source PDFs changed." → `convert_all_pdfs` with `force=true`
 4. "Convert all our compliance PDFs (including those in sub-folders) to Markdown so the knowledge-base server can search them." → `convert_all_pdfs` (with `--recursive` set at startup) feeding into `knowledge-base.py`'s `reference_search`
+
+## Skills (slash commands for each MCP)
+
+The [`skills/`](skills/) folder contains one Claude skill per server —
+`skills/<server>/SKILL.md` with YAML frontmatter (`name`, `description`) and
+a body that teaches an agent the server's tools, the right call order, and
+the sharp edges (read-only limits, sandboxes, tracked-changes workflow,
+when to reindex, …). Available skills:
+
+| Skill | Slash command | Backing server |
+|---|---|---|
+| `skills/confluence` | `/confluence` | `confluence.py` |
+| `skills/jira` | `/jira` | `jira.py` |
+| `skills/knowledge-base` | `/knowledge-base` | `knowledge-base.py` |
+| `skills/knowledge-base-rag` | `/knowledge-base-rag` | `knowledge-base-rag.py` |
+| `skills/ms-excel` | `/ms-excel` | `ms-excel.py` |
+| `skills/ms-outlook` | `/ms-outlook` | `ms-outlook.py` |
+| `skills/ms-word` | `/ms-word` | `ms-word.py` |
+| `skills/pdf-to-md` | `/pdf-to-md` | `pdf-to-md.py` |
+
+### Installing the skills
+
+- **Claude Code**: copy each `skills/<name>` folder into your project's
+  `.claude/skills/` (or `%USERPROFILE%\.claude\skills\` for all projects).
+  Claude invokes them automatically when relevant, and `/<name>` triggers
+  one explicitly.
+- **Cline**: Cline's slash commands are *workflows* — copy each skill's
+  `SKILL.md` into your workspace as `.clinerules/workflows/<name>.md`
+  (e.g. `.clinerules/workflows/ms-word.md`), then type `/ms-word.md` in
+  Cline to run it. The frontmatter is harmless there. To have Cline apply a
+  skill automatically (no slash command), drop it into `.clinerules/`
+  instead of `.clinerules/workflows/`.
+- **Continue**: add each `SKILL.md` body as a prompt file (Continue's
+  `prompts:` / *.prompt files) if you want `/`-invocable equivalents; the
+  files are plain Markdown, so they paste in unchanged.
+
+The skills only describe *how to use* the servers — each one still requires
+its MCP server to be configured in the client (sections above).
+
+## Versioning
+
+Every server carries `__version__` at the top of the file, printed by
+`--version` and reported to MCP clients via `serverInfo`. Versions follow
+semver and are bumped on EVERY change (see `CLAUDE.md`):
+
+- **MAJOR** — breaking change to configuration (flag/env-var renames) or to
+  a tool's name/arguments/output shape
+- **MINOR** — new tools, new flags, new behaviour (backwards compatible)
+- **PATCH** — bug fixes, documentation-only or internal changes
+
+The per-server versions are listed in the table at the top of this README;
+keep that table, the file's docstring title and `__version__` in sync.

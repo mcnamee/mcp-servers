@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-knowledge-base-rag.py
-=====================
+knowledge-base-rag.py (v1.2.1)
+==============================
 
 A single-file MCP (Model Context Protocol) server providing true RAG
 (Retrieval-Augmented Generation) over a folder of your own markdown
@@ -162,6 +162,10 @@ NOTES
   client certificate/key is loaded once at startup, so a bad path or wrong
   passphrase fails immediately with a clear message.
 """
+
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "1.2.1"
 
 import os
 import re
@@ -1086,7 +1090,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "knowledge-base-rag", "version": "1.2.0"}
+SERVER_INFO = {"name": "knowledge-base-rag", "version": __version__}
 
 SERVER_INSTRUCTIONS = (
     "This server is a RAG pipeline over a personal knowledge base of markdown "

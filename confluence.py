@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-confluence_mcp.py - A single-file MCP (Model Context Protocol) server for
-querying Confluence Data Center (tested against the 9.x v1 REST API) using
-only the Python 3 standard library.
+confluence.py (v1.3.0) - A single-file MCP (Model Context Protocol) server
+for querying Confluence Data Center (tested against the 9.x v1 REST API)
+using only the Python 3 standard library.
 
 It speaks MCP over stdio (newline-delimited JSON-RPC 2.0), which is what the
 Continue VSCode extension launches for a `type: stdio` server. No third-party
@@ -39,7 +39,14 @@ to other local users in process listings:
 
 Diagnostic output goes ONLY to stderr. stdout is reserved for the JSON-RPC
 stream - writing anything else there would corrupt the protocol.
+
+Run `--check` to connect once, print who you are authenticated as and how
+many spaces are visible (to stderr), then exit without starting the server.
 """
+
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "1.3.0"
 
 import argparse
 import base64
@@ -55,7 +62,7 @@ import urllib.parse
 import urllib.request
 
 SERVER_NAME = "confluence-mcp"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = __version__
 # Protocol version we default to if the client does not send one. We echo the
 # client's requested version when possible (see handle_initialize) so that we
 # stay compatible with whatever the host negotiated.
@@ -1038,7 +1045,33 @@ def build_arg_parser():
                         "file into this folder for a local RAG knowledge base "
                         "(env CONFLUENCE_KB_DIR). Files are named "
                         "'Confluence - <title>.md' and overwritten each time.")
+    p.add_argument("--check", action="store_true",
+                   help="Connect to Confluence, print who you are "
+                        "authenticated as and how many spaces are visible "
+                        "(to stderr), then exit (no server).")
+    p.add_argument("--version", action="version",
+                   version="{0} {1}".format(SERVER_NAME, __version__))
     return p
+
+
+def run_check(client):
+    """Connectivity check: authenticate and count visible spaces."""
+    try:
+        me = client._get("/rest/api/user/current")
+        log("Authenticated as : {} ({})".format(
+            me.get("displayName", "?"), me.get("username") or "?"))
+        spaces = client._get("/rest/api/space", {"limit": 100})
+        results = spaces.get("results")
+        visible = len(results) if isinstance(results, list) else "?"
+        log("Spaces visible   : {}{}".format(
+            visible, "+" if spaces.get("_links", {}).get("next") else ""))
+        if client.kb_dir:
+            log("KB mirror folder : {}".format(client.kb_dir))
+        log("CHECK OK")
+        return 0
+    except ConfluenceError as e:
+        log("CHECK FAILED: {}".format(e))
+        return 1
 
 
 def main(argv=None):
@@ -1090,6 +1123,9 @@ def main(argv=None):
     if client.kb_dir:
         log("knowledge-base mirroring enabled -> {}".format(client.kb_dir))
     log("configured for base URL {}".format(client.base_url))
+
+    if args.check:
+        return run_check(client)
 
     try:
         serve(client)

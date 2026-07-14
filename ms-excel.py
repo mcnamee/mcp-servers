@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-ms-excel.py -- Read-only Excel (.xlsx) MCP server for VSCode Continue.
+ms-excel.py (v2.0.0) -- Read-only Excel (.xlsx) MCP server for VSCode
+Continue / Cline.
 
 PURPOSE
     A single-file, standard-library-only MCP (Model Context Protocol) stdio
@@ -42,11 +43,13 @@ REQUIREMENTS
 
 CONFIGURATION
     Edit the CONFIG block directly below the imports. The workbook folder is
-    REQUIRED - set WORKBOOK_FOLDER there, or supply --folder / the
-    EXCEL_WORKBOOK_FOLDER environment variable at launch; the server refuses
+    REQUIRED - set DOCS_DIR there, or supply --docs-dir / the
+    EXCEL_DOCS_DIR environment variable at launch; the server refuses
     to start without one and only ever reads files inside it (symlinks that
     resolve outside the folder are excluded). Other settings can also be
     overridden per-run via command-line flags (see --help).
+    Precedence (suite-wide convention): CLI flag > environment variable >
+    constant in this file.
 
 STANDALONE TESTING (before wiring into Continue)
     1) Environment / config sanity check (prints interpreter + folder state):
@@ -82,7 +85,7 @@ INTEGRATION WITH CONTINUE (config.yaml)
           command: C:\path\to\python.exe
           args:
             - C:\path\to\ms-excel.py
-            - --folder
+            - --docs-dir
             - C:\path\to\your\workbooks
           env:
             PYTHONUTF8: "1"
@@ -96,6 +99,10 @@ PROTOCOL NOTE
     per line, no embedded newlines), which is the MCP stdio convention.
     Advertised protocolVersion is "2024-11-05".
 """
+
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "2.0.0"
 
 import sys
 import os
@@ -113,10 +120,10 @@ from datetime import datetime, timedelta
 # REQUIRED: folder containing the .xlsx workbooks the model is allowed to
 # read. The server only ever reads files inside this folder (symlinks that
 # resolve outside it are excluded) and REFUSES TO START without one. Set it
-# here, or at launch with --folder or the EXCEL_WORKBOOK_FOLDER environment
+# here, or at launch with --docs-dir or the EXCEL_DOCS_DIR environment
 # variable (which take priority over this constant).
-#   e.g. WORKBOOK_FOLDER = r"C:\Users\me\Documents\workbooks"
-WORKBOOK_FOLDER = None
+#   e.g. DOCS_DIR = r"C:\Users\me\Documents\workbooks"
+DOCS_DIR = None
 
 # File extensions treated as readable workbooks (lower-case, incl. dot).
 ALLOWED_EXTENSIONS = (".xlsx", ".xlsm")
@@ -129,7 +136,7 @@ MAX_CELL_TEXT_LEN = 500      # long cell text is truncated to this many chars
 
 # Server identity reported to the client.
 SERVER_NAME = "excel-readonly"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = __version__
 PROTOCOL_VERSION = "2024-11-05"
 
 # ===========================================================================
@@ -585,9 +592,9 @@ def list_workbook_files(folder):
     """
     if not folder:
         raise WorkbookError(
-            "No workbook folder configured. Pass --folder, set the "
-            "EXCEL_WORKBOOK_FOLDER environment variable, or set "
-            "WORKBOOK_FOLDER in this file."
+            "No workbook folder configured. Pass --docs-dir, set the "
+            "EXCEL_DOCS_DIR environment variable, or set "
+            "DOCS_DIR in this file."
         )
     if not os.path.isdir(folder):
         raise WorkbookError("Workbook folder does not exist: %s" % folder)
@@ -1191,19 +1198,21 @@ def serve(folder):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Read-only Excel (.xlsx) MCP server for VSCode Continue.")
-    parser.add_argument("--folder",
-                        default=os.environ.get("EXCEL_WORKBOOK_FOLDER",
-                                               WORKBOOK_FOLDER),
+    parser.add_argument("--docs-dir",
+                        default=os.environ.get("EXCEL_DOCS_DIR",
+                                               DOCS_DIR),
                         help="Folder containing .xlsx/.xlsm workbooks. Falls "
-                             "back to the EXCEL_WORKBOOK_FOLDER environment "
+                             "back to the EXCEL_DOCS_DIR environment "
                              "variable, then the CONFIG block default.")
     parser.add_argument("--check", action="store_true",
                         help="Print environment/config diagnostics and exit.")
     parser.add_argument("--list", action="store_true",
                         help="List readable workbooks in the folder and exit.")
+    parser.add_argument("--version", action="version",
+                        version="{0} {1}".format(SERVER_NAME, __version__))
     args = parser.parse_args(argv)
 
-    folder = args.folder
+    folder = args.docs_dir
 
     if args.check:
         print("excel_mcp environment check")
@@ -1226,9 +1235,9 @@ def main(argv=None):
     # The workbook folder is REQUIRED: the server only reads inside it and
     # must not start unconfined.
     if not folder:
-        log("FATAL: no workbook folder configured. Pass --folder, set the "
-            "EXCEL_WORKBOOK_FOLDER environment variable, or set "
-            "WORKBOOK_FOLDER in this file.")
+        log("FATAL: no workbook folder configured. Pass --docs-dir, set the "
+            "EXCEL_DOCS_DIR environment variable, or set "
+            "DOCS_DIR in this file.")
         return 2
     if not os.path.isdir(folder):
         log("FATAL: the configured workbook folder does not exist or is not "
