@@ -404,9 +404,14 @@ resolves a relative path against the **document root**, so *"edit Policy
 even located if it sits in a subfolder of the root. Previously a relative name
 resolved against the server's working directory (wherever the client launched
 Python), so it fell outside the sandbox and the model had to guess the full
-path. Use **`msword_list_documents`** (optionally with a `query` substring) to
-list the `.docx` files under the root — name, relative path, size and modified
-time — when you're unsure of the exact name.
+path. If there's no exact match, `msword_open` falls back to a **fuzzy name
+match** (same matcher as `pdf-to-md.py`), so *"budget policy"* opens
+`Budget Policy 2024.docx`; when a fuzzy match is used the result carries
+`fuzzy_matched: true` and the requested text so the caller can confirm it got
+the right file, and a genuinely ambiguous name returns the tied candidates
+rather than guessing. Use **`msword_list_documents`** (optionally with a
+`query` substring) to list the `.docx` files under the root — name, relative
+path, size and modified time — when you're unsure of the exact name.
 
 **Building a RAG knowledge base.** Point `--kb-dir` at the same folder your
 knowledge-base servers (`knowledge-base.py` / `knowledge-base-rag.py`)
@@ -677,23 +682,24 @@ one or more of the tools the server exposes.
 ### ms-word.py
 
 1. "Edit the Word file Policy 103.docx to…" → `msword_open` with `path: "Policy 103.docx"` (resolved against the document root — no absolute path needed) + the editing tools
-2. "What Word documents do I have?" / "I'm not sure of the exact file name." → `msword_list_documents` (optionally with a `query`), then `msword_open` on the one you want
-3. "Open the proposal.docx and show me its full text." → `msword_open` + `msword_get_content`
-4. "Open every .docx in my docs folder so it gets mirrored into the RAG knowledge base as Markdown." → `msword_open` with `--kb-dir` set (each open writes `Word - <name>.md` next to the Confluence pages for `knowledge-base.py` / `knowledge-base-rag.py` to index)
-5. "Create a new status report document and draft it with a title, headings and a summary table, then save it to my generated-docs folder." → `msword_create` (writes to `--output-dir`) + `msword_add_heading` + `msword_add_paragraph` + `msword_add_table` + `msword_save`
-6. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
-7. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
-8. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
-9. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
-10. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
-11. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
-12. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
-13. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
-14. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
-15. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
-16. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
-17. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
-18. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
+2. "Open the budget policy doc." (name not exact) → `msword_open` with `path: "budget policy"` (fuzzy-matches `Budget Policy 2024.docx`; the result flags `fuzzy_matched` so you can confirm)
+4. "What Word documents do I have?" / "I'm not sure of the exact file name." → `msword_list_documents` (optionally with a `query`), then `msword_open` on the one you want
+5. "Open the proposal.docx and show me its full text." → `msword_open` + `msword_get_content`
+6. "Open every .docx in my docs folder so it gets mirrored into the RAG knowledge base as Markdown." → `msword_open` with `--kb-dir` set (each open writes `Word - <name>.md` next to the Confluence pages for `knowledge-base.py` / `knowledge-base-rag.py` to index)
+7. "Create a new status report document and draft it with a title, headings and a summary table, then save it to my generated-docs folder." → `msword_create` (writes to `--output-dir`) + `msword_add_heading` + `msword_add_paragraph` + `msword_add_table` + `msword_save`
+8. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
+9. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
+10. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
+11. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
+12. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
+13. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
+14. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
+15. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
+16. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
+17. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
+18. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
+19. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
+20. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
 
 ### pdf-to-md.py
 
