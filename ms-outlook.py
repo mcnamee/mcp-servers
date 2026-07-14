@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ms-outlook.py
-==============
+ms-outlook.py (v1.5.1)
+======================
 
 A single-file MCP (Model Context Protocol) server giving an LLM read-only
 access to a locally installed *classic* Microsoft Outlook client (mail +
@@ -155,6 +155,10 @@ IMPORTANT (stdio-on-Windows pitfalls)
   stdout is UTF-8 and Unicode subjects do not crash on cp1252.
 """
 
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "1.5.1"
+
 import os
 import re
 import sys
@@ -237,6 +241,12 @@ def log(message):
     """Write a diagnostic line to stderr ONLY. Never touch stdout here."""
     print(message, file=sys.stderr, flush=True)
 
+
+# --version must work even when pywin32 is not installed (or off Windows),
+# so answer it before the import below can fail.
+if "--version" in sys.argv:
+    print("outlook-mcp {0}".format(__version__))
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # pywin32 import. If it is missing the server cannot function, so fail loudly.
@@ -1366,7 +1376,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "outlook-mcp", "version": "1.5.0"}
+SERVER_INFO = {"name": "outlook-mcp", "version": __version__}
 
 
 def rpc_result(req_id, result):

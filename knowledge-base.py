@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-knowledge-base.py
-================
+knowledge-base.py (v2.0.0)
+==========================
 
 A single-file MCP (Model Context Protocol) server that gives an LLM
 read-only access to a folder of local reference documents (markdown / text).
@@ -33,13 +33,13 @@ TOOLS EXPOSED (all read-only)
 CONFIGURATION
 -------------
 The reference folder is supplied via --docs-dir (preferred) or the
-REFERENCE_DOCS_DIR environment variable. In Continue's config.yaml:
+KB_DOCS_DIR environment variable. In Continue's config.yaml:
 
     mcpServers:
       - name: reference
         command: python
         args:
-          - C:\\path\\to\\reference_mcp.py
+          - C:\\path\\to\\knowledge-base.py
           - --docs-dir
           - C:\\reference-docs
         env:
@@ -48,10 +48,10 @@ REFERENCE_DOCS_DIR environment variable. In Continue's config.yaml:
 USAGE
 -----
 - As an MCP server (normal mode): launched by the MCP client. Run with the
-  --docs-dir argument (or REFERENCE_DOCS_DIR set).
+  --docs-dir argument (or KB_DOCS_DIR set).
 - Connectivity check (run manually on the endpoint first):
 
-      python reference_mcp.py --docs-dir C:\\reference-docs --check
+      python knowledge-base.py --docs-dir C:\\reference-docs --check
 
   Lists the folder contents to stderr and exits, so you can confirm the right
   files are visible in a single transfer cycle.
@@ -63,7 +63,14 @@ NOTES
   crash on the default Windows cp1252 codec.
 - Path traversal is blocked: a requested document is always resolved INSIDE
   the configured folder; requests pointing outside it are refused.
+- KB_DOCS_DIR is deliberately the SAME env var knowledge-base-rag.py uses,
+  so both servers can point at one folder with one setting. Set env per
+  server entry in your MCP client config if you need different folders.
 """
+
+# Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
+# MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
+__version__ = "2.0.0"
 
 import os
 import re
@@ -469,7 +476,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "reference-mcp", "version": "1.0.1"}
+SERVER_INFO = {"name": "reference-mcp", "version": __version__}
 
 
 def rpc_result(req_id, result):
@@ -574,9 +581,9 @@ def main():
     )
     parser.add_argument(
         "--docs-dir",
-        default=os.environ.get("REFERENCE_DOCS_DIR"),
+        default=os.environ.get("KB_DOCS_DIR"),
         help="Folder containing reference documents. Falls back to the "
-             "REFERENCE_DOCS_DIR environment variable.",
+             "KB_DOCS_DIR environment variable.",
     )
     parser.add_argument(
         "--check",
@@ -592,7 +599,7 @@ def main():
 
     # Validate the folder before doing anything else; fail loudly on stderr.
     if not args.docs_dir:
-        log("FATAL: no reference folder set. Pass --docs-dir or set REFERENCE_DOCS_DIR.")
+        log("FATAL: no reference folder set. Pass --docs-dir or set KB_DOCS_DIR.")
         sys.exit(2)
     if not os.path.isdir(args.docs_dir):
         log("FATAL: reference folder does not exist or is not a directory: {0}".format(args.docs_dir))
