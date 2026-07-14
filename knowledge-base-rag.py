@@ -67,6 +67,11 @@ ONLY (command lines are visible to other local users in process listings).
 | KB_CHAT_MAX_TOKENS      | --chat-max-tokens    | max_tokens for generation (default 1024, 0 = omit field)    |
 | KB_CHAT_EXTRA_HEADERS   | (env only)           | JSON object of extra HTTP headers for the chat endpoint     |
 | KB_CA_CERT              | --ca-cert            | PEM CA bundle for an internal CA                            |
+| KB_CLIENT_CERT          | --client-cert        | PEM client certificate, for gateways that require mutual    |
+|                         |                      | TLS (mTLS). Presented to BOTH endpoints                     |
+| KB_CLIENT_KEY           | --client-key         | PEM private key for the client certificate (omit if the     |
+|                         |                      | --client-cert file contains both cert and key)              |
+| KB_CLIENT_KEY_PASSWORD  | (env only)           | Passphrase, if the client private key is encrypted          |
 | KB_VERIFY_SSL=false     | --insecure           | Disable TLS certificate verification                        |
 | KB_TIMEOUT              | --timeout            | HTTP timeout seconds (default 120)                          |
 | KB_CHUNK_CHARS          | --chunk-chars        | Soft max characters per chunk (default 1500)                |
@@ -133,6 +138,13 @@ NOTES
   RAG is) - point the server only at material appropriate for those APIs.
 - If you change embedding model, the vector dimensions change: run
   --reindex --force once to rebuild the index.
+- Mutual TLS: a gateway error like CERTIFICATE_NOT_PROVIDED (or a TLS
+  handshake failure / connection reset during --check) means the gateway
+  requires a CLIENT certificate. Configure --client-cert/--client-key;
+  --insecure cannot fix this, because it only disables YOUR verification of
+  the server - it does not change the certificate you present to it. The
+  client certificate/key is loaded once at startup, so a bad path or wrong
+  passphrase fails immediately with a clear message.
 """
 
 import os
@@ -194,6 +206,9 @@ class Config(object):
     chat_max_tokens = 1024
     chat_extra_headers = {}
     ca_cert = ""
+    client_cert = ""
+    client_key = ""
+    client_key_password = ""
     verify_ssl = True
     timeout = 120
     chunk_chars = 1500
@@ -277,14 +292,31 @@ def file_hash(path):
 # ---------------------------------------------------------------------------
 
 def build_ssl_context():
-    if not CFG.verify_ssl:
+    if CFG.ca_cert and CFG.verify_ssl:
+        context = ssl.create_default_context(cafile=CFG.ca_cert)
+    else:
         context = ssl.create_default_context()
+    if not CFG.verify_ssl:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        return context
-    if CFG.ca_cert:
-        return ssl.create_default_context(cafile=CFG.ca_cert)
-    return ssl.create_default_context()
+    if CFG.client_cert:
+        # Mutual TLS: present our certificate to the gateway. Independent of
+        # verify_ssl, which only controls how we verify the SERVER.
+        try:
+            context.load_cert_chain(
+                certfile=CFG.client_cert,
+                keyfile=CFG.client_key or None,
+                password=CFG.client_key_password or None,
+            )
+        except (ssl.SSLError, OSError) as exc:
+            raise RagError(
+                "Could not load the mutual-TLS client certificate/key "
+                "({0} / {1}): {2}. If the key is encrypted, set "
+                "KB_CLIENT_KEY_PASSWORD.".format(
+                    CFG.client_cert,
+                    CFG.client_key or "key expected in the cert file",
+                    exc))
+    return context
 
 
 def auth_headers(key, header_name):
@@ -294,6 +326,18 @@ def auth_headers(key, header_name):
     if header_name.strip().lower() == "authorization":
         return {"Authorization": "Bearer " + key}
     return {header_name.strip(): key}
+
+
+def _mtls_hint(error):
+    """Append advice when a TLS failure looks like a missing client certificate."""
+    text = str(error)
+    if ("CERTIFICATE_REQUIRED" in text or "certificate required" in text.lower()
+            or "CERTIFICATE_NOT_PROVIDED" in text or "handshake failure" in text.lower()):
+        return (" This looks like the endpoint requires a CLIENT certificate "
+                "(mutual TLS): configure --client-cert / --client-key. "
+                "--insecure cannot fix this - it only disables verification "
+                "of the server, not the certificate you present.")
+    return ""
 
 
 def http_post_json(url, payload, headers):
@@ -314,9 +358,17 @@ def http_post_json(url, payload, headers):
             detail = exc.read().decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
-        raise RagError("HTTP {0} from {1}: {2}".format(exc.code, url, detail or exc.reason))
+        raise RagError("HTTP {0} from {1}: {2}{3}".format(
+            exc.code, url, detail or exc.reason, _mtls_hint(detail or exc.reason)))
     except urllib.error.URLError as exc:
-        raise RagError("Could not reach {0}: {1}".format(url, exc.reason))
+        raise RagError("Could not reach {0}: {1}{2}".format(
+            url, exc.reason, _mtls_hint(exc.reason)))
+    except OSError as exc:
+        # TLS alerts can surface on the first read (TLS 1.3), outside
+        # urllib's URLError wrapping - e.g. a gateway rejecting the handshake
+        # because no client certificate was presented.
+        raise RagError("Connection to {0} failed: {1}{2}".format(
+            url, exc, _mtls_hint(exc)))
     except json.JSONDecodeError:
         raise RagError("Non-JSON response from {0}.".format(url))
 
@@ -835,6 +887,11 @@ def tool_kb_status(_args):
     lines.append("Embeddings endpoint   : {0} (style: {1}, model: {2}, key: {3})".format(
         CFG.embed_url, CFG.embed_style, CFG.embed_model or "(none)",
         "set" if CFG.embed_key else "NOT SET"))
+    lines.append("Mutual TLS (client)   : {0}".format(
+        "cert: {0}, key: {1}, passphrase: {2}".format(
+            CFG.client_cert, CFG.client_key or "(in cert file)",
+            "set" if CFG.client_key_password else "not set")
+        if CFG.client_cert else "(none)"))
     lines.append("Generation endpoint   : {0}".format(
         "{0} (model: {1}, key: {2})".format(
             CFG.chat_url, CFG.chat_model or "(none)",
@@ -939,7 +996,7 @@ TOOL_DISPATCH = {
 # ---------------------------------------------------------------------------
 
 PROTOCOL_VERSION_DEFAULT = "2024-11-05"
-SERVER_INFO = {"name": "knowledge-base-rag", "version": "1.0.0"}
+SERVER_INFO = {"name": "knowledge-base-rag", "version": "1.1.0"}
 
 SERVER_INSTRUCTIONS = (
     "This server is a RAG pipeline over a personal knowledge base of markdown "
@@ -1154,6 +1211,13 @@ def main():
                         help="max_tokens for generation; 0 omits the field (env: KB_CHAT_MAX_TOKENS; default: 1024).")
     parser.add_argument("--ca-cert", default=env("KB_CA_CERT", ""),
                         help="Path to a PEM CA bundle for an internal CA (env: KB_CA_CERT).")
+    parser.add_argument("--client-cert", default=env("KB_CLIENT_CERT", ""),
+                        help="Path to a PEM client certificate, for gateways requiring "
+                             "mutual TLS (env: KB_CLIENT_CERT). Presented to both endpoints.")
+    parser.add_argument("--client-key", default=env("KB_CLIENT_KEY", ""),
+                        help="Path to the PEM private key for --client-cert; omit if the "
+                             "cert file contains both (env: KB_CLIENT_KEY). An encrypted "
+                             "key's passphrase goes in KB_CLIENT_KEY_PASSWORD (env only).")
     parser.add_argument("--insecure", action="store_true",
                         default=env_flag_false("KB_VERIFY_SSL"),
                         help="Disable TLS certificate verification (env: KB_VERIFY_SSL=false).")
@@ -1198,6 +1262,15 @@ def main():
     if args.ca_cert and not os.path.isfile(args.ca_cert):
         log("FATAL: --ca-cert file not found: {0}".format(args.ca_cert))
         sys.exit(2)
+    if args.client_key and not args.client_cert:
+        log("FATAL: --client-key was given without --client-cert.")
+        sys.exit(2)
+    if args.client_cert and not os.path.isfile(args.client_cert):
+        log("FATAL: --client-cert file not found: {0}".format(args.client_cert))
+        sys.exit(2)
+    if args.client_key and not os.path.isfile(args.client_key):
+        log("FATAL: --client-key file not found: {0}".format(args.client_key))
+        sys.exit(2)
 
     CFG.docs_dir = os.path.realpath(args.docs_dir)
     CFG.index_dir = os.path.realpath(
@@ -1219,6 +1292,9 @@ def main():
     CFG.chat_max_tokens = args.chat_max_tokens
     CFG.chat_extra_headers = parse_extra_headers("KB_CHAT_EXTRA_HEADERS")
     CFG.ca_cert = args.ca_cert
+    CFG.client_cert = args.client_cert
+    CFG.client_key = args.client_key
+    CFG.client_key_password = os.environ.get("KB_CLIENT_KEY_PASSWORD", "")
     CFG.verify_ssl = not args.insecure
     CFG.timeout = max(1, args.timeout)
     CFG.chunk_chars = max(200, args.chunk_chars)
@@ -1227,6 +1303,15 @@ def main():
 
     if not CFG.verify_ssl:
         log("WARNING: TLS certificate verification is DISABLED.")
+
+    # Fail fast on an unloadable client cert/key (bad file, wrong passphrase)
+    # rather than surfacing it on the first tool call.
+    if CFG.client_cert:
+        try:
+            build_ssl_context()
+        except RagError as exc:
+            log("FATAL: {0}".format(exc))
+            sys.exit(2)
 
     if args.check:
         sys.exit(run_check())
