@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-knowledge-base-rag.py (v1.2.1)
+knowledge-base-rag.py (v1.3.0)
 ==============================
 
 A single-file MCP (Model Context Protocol) server providing true RAG
@@ -55,9 +55,11 @@ ONLY (command lines are visible to other local users in process listings).
 | KB_EMBED_API_KEY        | (env only)           | API key for the embeddings endpoint                         |
 | KB_EMBED_AUTH_HEADER    | --embed-auth-header  | Header the key is sent in. Default Authorization (Bearer);  |
 |                         |                      | any other name (e.g. api-key for Azure) sends the raw key   |
-| KB_EMBED_STYLE          | --embed-style        | Request format: openai (default), ollama, or kserve-jina    |
-|                         |                      | (KServe V2 inference protocol, e.g. a Jina model on KServe) |
+| KB_EMBED_STYLE          | --embed-style        | Request format: openai (default), ollama, kserve-jina       |
+|                         |                      | (KServe V2 inference protocol), or raw-json (plain          |
+|                         |                      | {"<key>": [texts]} body, for KServe CUSTOM predictors)      |
 | KB_EMBED_TENSOR_NAME    | --embed-tensor-name  | kserve-jina only: name of the input tensor (default: text)  |
+| KB_EMBED_JSON_KEY       | --embed-json-key     | raw-json only: key the texts are sent under (default: texts)|
 | KB_EMBED_BATCH          | --embed-batch        | Texts per embeddings request (default 16; ollama is 1-by-1) |
 | KB_EMBED_QUERY_PREFIX   | --embed-query-prefix | Prefix for query embeds (e5-style models: "query: ")        |
 | KB_EMBED_DOC_PREFIX     | --embed-doc-prefix   | Prefix for document embeds ("passage: ")                    |
@@ -99,6 +101,20 @@ Endpoint formats ("where you have unknowns"):
                               set --embed-tensor-name (default: text).
                               KServe V1 ({"instances": [...]} ->
                               {"predictions": [...]}) is also parsed.
+  --embed-style raw-json    : plain JSON body {"texts": [texts]} (key set by
+                              --embed-json-key, plus "model" if --embed-model
+                              is given). For KServe CUSTOM predictors and
+                              other bespoke wrappers that unpack the raw
+                              request body into their pipeline's arguments -
+                              the symptom that calls for this style is a
+                              server error like "pipeline() missing 1
+                              required positional argument: 'texts'" that
+                              does NOT change when --embed-tensor-name does
+                              (the wrapper reads body keys, not tensors).
+                              The response is parsed with the same tolerant
+                              reader as every other style (OpenAI "data",
+                              "embedding"/"embeddings", KServe "outputs"/
+                              "predictions").
   Response parsing also falls back to top-level "embedding"/"embeddings",
   so most bespoke internal endpoints work with style=openai unchanged.
   Generation POSTs OpenAI chat-completions JSON and falls back to Ollama
@@ -165,7 +181,7 @@ NOTES
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 import os
 import re
@@ -216,6 +232,7 @@ class Config(object):
     embed_auth_header = "Authorization"
     embed_style = "openai"
     embed_tensor_name = "text"
+    embed_json_key = "texts"
     embed_batch = 16
     embed_query_prefix = ""
     embed_doc_prefix = ""
@@ -509,6 +526,16 @@ def embed_texts(texts, is_query=False):
                     "data": batch,
                 }],
             }
+            data = http_post_json(CFG.embed_url, payload, headers)
+            vectors.extend(_parse_embedding_response(data, len(batch)))
+    elif CFG.embed_style == "raw-json":
+        # Plain JSON body for custom predictors that unpack the request dict
+        # straight into their pipeline's arguments (no tensor envelope).
+        for start in range(0, len(inputs), CFG.embed_batch):
+            batch = inputs[start:start + CFG.embed_batch]
+            payload = {CFG.embed_json_key: batch}
+            if CFG.embed_model:
+                payload["model"] = CFG.embed_model
             data = http_post_json(CFG.embed_url, payload, headers)
             vectors.extend(_parse_embedding_response(data, len(batch)))
     else:  # openai-compatible (the default)
@@ -978,6 +1005,8 @@ def tool_kb_status(_args):
     style = CFG.embed_style
     if style == "kserve-jina":
         style += ", tensor: " + CFG.embed_tensor_name
+    elif style == "raw-json":
+        style += ", json key: " + CFG.embed_json_key
     lines.append("Embeddings endpoint   : {0} (style: {1}, model: {2}, key: {3})".format(
         CFG.embed_url, style, CFG.embed_model or "(none)",
         "set" if CFG.embed_key else "NOT SET"))
@@ -1282,15 +1311,21 @@ def main():
     parser.add_argument("--embed-auth-header", default=env("KB_EMBED_AUTH_HEADER", "Authorization"),
                         help="Header for the embed API key; 'Authorization' sends 'Bearer <key>', "
                              "anything else (e.g. 'api-key') sends the raw key (env: KB_EMBED_AUTH_HEADER).")
-    parser.add_argument("--embed-style", choices=["openai", "ollama", "kserve-jina"],
+    parser.add_argument("--embed-style", choices=["openai", "ollama", "kserve-jina", "raw-json"],
                         default=env("KB_EMBED_STYLE", "openai"),
                         help="Embeddings request format (env: KB_EMBED_STYLE; default: openai). "
                              "kserve-jina speaks the KServe V2 Open Inference Protocol "
                              "(input tensors), e.g. a Jina embeddings model on KServe; "
-                             "the model name is part of the --embed-url path.")
+                             "the model name is part of the --embed-url path. raw-json "
+                             "POSTs a plain {\"<key>\": [texts]} body for KServe CUSTOM "
+                             "predictors that unpack the request dict into their "
+                             "pipeline's arguments.")
     parser.add_argument("--embed-tensor-name", default=env("KB_EMBED_TENSOR_NAME", "text"),
                         help="kserve-jina style only: name of the input tensor the texts are "
                              "sent as (env: KB_EMBED_TENSOR_NAME; default: text).")
+    parser.add_argument("--embed-json-key", default=env("KB_EMBED_JSON_KEY", "texts"),
+                        help="raw-json style only: the JSON key the batch of texts is sent "
+                             "under (env: KB_EMBED_JSON_KEY; default: texts).")
     parser.add_argument("--embed-batch", type=int, default=int(env("KB_EMBED_BATCH", "16")),
                         help="Texts per embeddings request, openai style (env: KB_EMBED_BATCH; default: 16).")
     parser.add_argument("--embed-query-prefix", default=env("KB_EMBED_QUERY_PREFIX", ""),
@@ -1382,6 +1417,7 @@ def main():
     CFG.embed_auth_header = args.embed_auth_header
     CFG.embed_style = args.embed_style
     CFG.embed_tensor_name = args.embed_tensor_name
+    CFG.embed_json_key = args.embed_json_key
     CFG.embed_batch = max(1, args.embed_batch)
     CFG.embed_query_prefix = args.embed_query_prefix
     CFG.embed_doc_prefix = args.embed_doc_prefix
