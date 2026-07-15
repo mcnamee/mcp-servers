@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-knowledge-base-rag.py (v1.3.0)
+knowledge-base-rag.py (v1.4.0)
 ==============================
 
 A single-file MCP (Model Context Protocol) server providing true RAG
@@ -60,6 +60,17 @@ ONLY (command lines are visible to other local users in process listings).
 |                         |                      | {"<key>": [texts]} body, for KServe CUSTOM predictors)      |
 | KB_EMBED_TENSOR_NAME    | --embed-tensor-name  | kserve-jina only: name of the input tensor (default: text)  |
 | KB_EMBED_JSON_KEY       | --embed-json-key     | raw-json only: key the texts are sent under (default: texts)|
+| KB_EMBED_TEMPLATE       | --embed-template     | FULL request-body control: a JSON document with "__TEXTS__" |
+|                         |                      | where the array of texts goes (and optional "__MODEL__").   |
+|                         |                      | When set it OVERRIDES --embed-style's request shape. E.g.   |
+|                         |                      | {"inputs": {"texts": "__TEXTS__"}} for a FastAPI wrapper    |
+|                         |                      | that nests the pipeline arguments under an "inputs" field   |
+| KB_EMBED_RESPONSE_PATH  | --embed-response-path| Dotted path to the vectors in the response when the         |
+|                         |                      | automatic detection can't find them, e.g.                   |
+|                         |                      | "outputs.embeddings" or "result.0.vectors". Applies to      |
+|                         |                      | every style; list indexes are numeric path parts            |
+| KB_DEBUG=1              | --debug              | Log every request/response body (truncated) to stderr -     |
+|                         |                      | shows the exact JSON sent, for matching an unknown endpoint |
 | KB_EMBED_BATCH          | --embed-batch        | Texts per embeddings request (default 16; ollama is 1-by-1) |
 | KB_EMBED_QUERY_PREFIX   | --embed-query-prefix | Prefix for query embeds (e5-style models: "query: ")        |
 | KB_EMBED_DOC_PREFIX     | --embed-doc-prefix   | Prefix for document embeds ("passage: ")                    |
@@ -115,8 +126,24 @@ Endpoint formats ("where you have unknowns"):
                               reader as every other style (OpenAI "data",
                               "embedding"/"embeddings", KServe "outputs"/
                               "predictions").
+  --embed-template          : when none of the styles matches your endpoint,
+                              take full control of the request body. The
+                              value is the COMPLETE JSON body to send, with
+                              the JSON string "__TEXTS__" marking where the
+                              array of texts goes ("__MODEL__" likewise for
+                              --embed-model). Batching still applies. E.g. a
+                              FastAPI custom predictor that validates
+                              {"inputs": {"texts": [...]}} (the symptom is an
+                              HTTP 422 with loc [body, inputs]) is:
+                                KB_EMBED_TEMPLATE={"inputs": {"texts": "__TEXTS__"}}
   Response parsing also falls back to top-level "embedding"/"embeddings",
-  so most bespoke internal endpoints work with style=openai unchanged.
+  so most bespoke internal endpoints work with style=openai unchanged. If
+  the vectors sit somewhere the auto-detection can't see (e.g. under
+  {"outputs": {"embeddings": ...}}), point at them with
+  --embed-response-path outputs.embeddings (numeric parts index lists).
+  Set KB_DEBUG=1 / --debug to log every request and response body
+  (truncated) to stderr - run --check with it to see exactly what is sent,
+  and compare with what your endpoint's team expects.
   Generation POSTs OpenAI chat-completions JSON and falls back to Ollama
   /api/chat ("message"."content") and /api/generate ("response") shapes.
 
@@ -181,7 +208,7 @@ NOTES
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import os
 import re
@@ -233,6 +260,9 @@ class Config(object):
     embed_style = "openai"
     embed_tensor_name = "text"
     embed_json_key = "texts"
+    embed_template = None      # parsed JSON template, or None
+    embed_response_path = ""
+    debug = False
     embed_batch = 16
     embed_query_prefix = ""
     embed_doc_prefix = ""
@@ -378,9 +408,17 @@ def _mtls_hint(error):
     return ""
 
 
+def _debug_log(label, text):
+    """When --debug / KB_DEBUG=1 is on, log a (truncated) payload to stderr."""
+    if CFG.debug:
+        text = text if len(text) <= 2000 else text[:2000] + " ...[truncated]"
+        log("DEBUG {0}: {1}".format(label, text))
+
+
 def http_post_json(url, payload, headers):
     """POST JSON, return the decoded JSON response. Raises RagError on failure."""
     body = json.dumps(payload).encode("utf-8")
+    _debug_log("POST " + url, body.decode("utf-8"))
     request = urllib.request.Request(url, data=body, method="POST")
     request.add_header("Content-Type", "application/json")
     request.add_header("Accept", "application/json")
@@ -389,7 +427,9 @@ def http_post_json(url, payload, headers):
     try:
         with urllib.request.urlopen(request, timeout=CFG.timeout,
                                     context=build_ssl_context()) as response:
-            return json.loads(response.read().decode("utf-8", errors="replace"))
+            raw = response.read().decode("utf-8", errors="replace")
+            _debug_log("RESPONSE " + url, raw)
+            return json.loads(raw)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -414,6 +454,55 @@ def http_post_json(url, payload, headers):
 # ---------------------------------------------------------------------------
 # Embeddings client
 # ---------------------------------------------------------------------------
+
+TEMPLATE_TEXTS = "__TEXTS__"
+TEMPLATE_MODEL = "__MODEL__"
+
+
+def fill_template(node, texts):
+    """
+    Deep-copy the request template, substituting the "__TEXTS__" placeholder
+    with the list of texts and "__MODEL__" with the configured model name.
+    """
+    if isinstance(node, dict):
+        return {key: fill_template(value, texts) for key, value in node.items()}
+    if isinstance(node, list):
+        return [fill_template(value, texts) for value in node]
+    if node == TEMPLATE_TEXTS:
+        return texts
+    if node == TEMPLATE_MODEL:
+        return CFG.embed_model
+    return node
+
+
+def count_template_placeholders(node):
+    """How many times the "__TEXTS__" placeholder appears in a template."""
+    if isinstance(node, dict):
+        return sum(count_template_placeholders(v) for v in node.values())
+    if isinstance(node, list):
+        return sum(count_template_placeholders(v) for v in node)
+    return 1 if node == TEMPLATE_TEXTS else 0
+
+
+def extract_by_path(data, path):
+    """
+    Follow a dotted path into a JSON structure: dict parts are keys, numeric
+    parts index lists ("outputs.embeddings", "result.0.vectors"). Returns
+    None if any step is missing.
+    """
+    node = data
+    for part in path.split("."):
+        if isinstance(node, list):
+            try:
+                node = node[int(part)]
+            except (ValueError, IndexError):
+                return None
+        elif isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return None
+    return node
+
 
 def _vectors_from_tensor(raw, shape, expected):
     """
@@ -471,7 +560,14 @@ def _parse_embedding_response(data, expected):
     [...]}, {"embeddings":[[...]]}, and KServe V2/V1 tensor responses.
     """
     vectors = None
-    if isinstance(data, dict):
+    if CFG.embed_response_path:
+        # Explicit location wins over auto-detection.
+        node = extract_by_path(data, CFG.embed_response_path)
+        if isinstance(node, list) and node and isinstance(node[0], dict):
+            vectors = [item.get("embedding") for item in node]
+        else:
+            vectors = _vectors_from_tensor(node, None, expected)
+    elif isinstance(data, dict):
         if isinstance(data.get("data"), list):
             items = sorted(data["data"], key=lambda item: item.get("index", 0))
             vectors = [item.get("embedding") for item in items]
@@ -484,9 +580,14 @@ def _parse_embedding_response(data, expected):
     if (not vectors or len(vectors) != expected
             or any(not isinstance(v, list) or not v for v in vectors)):
         raise RagError(
-            "Unexpected embeddings response shape (expected {0} vector(s)). "
-            "Check --embed-style / the endpoint URL. Response keys: {1}".format(
-                expected, list(data.keys()) if isinstance(data, dict) else type(data).__name__))
+            "Unexpected embeddings response shape (expected {0} vector(s)){1}. "
+            "Check --embed-style / the endpoint URL, or point at the vectors "
+            "with --embed-response-path; run --check with --debug to see the "
+            "raw response. Response keys: {2}".format(
+                expected,
+                " at response path '{0}'".format(CFG.embed_response_path)
+                if CFG.embed_response_path else "",
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__))
     return vectors
 
 
@@ -502,7 +603,14 @@ def embed_texts(texts, is_query=False):
     headers.update(auth_headers(CFG.embed_key, CFG.embed_auth_header))
 
     vectors = []
-    if CFG.embed_style == "ollama":
+    if CFG.embed_template is not None:
+        # A request template overrides the style's request shape entirely.
+        for start in range(0, len(inputs), CFG.embed_batch):
+            batch = inputs[start:start + CFG.embed_batch]
+            payload = fill_template(CFG.embed_template, batch)
+            data = http_post_json(CFG.embed_url, payload, headers)
+            vectors.extend(_parse_embedding_response(data, len(batch)))
+    elif CFG.embed_style == "ollama":
         for text in inputs:
             payload = {"prompt": text}
             if CFG.embed_model:
@@ -1003,10 +1111,14 @@ def tool_kb_status(_args):
     except Exception as exc:
         lines.append("Index status          : unavailable ({0})".format(exc))
     style = CFG.embed_style
-    if style == "kserve-jina":
+    if CFG.embed_template is not None:
+        style += ", request template set"
+    elif style == "kserve-jina":
         style += ", tensor: " + CFG.embed_tensor_name
     elif style == "raw-json":
         style += ", json key: " + CFG.embed_json_key
+    if CFG.embed_response_path:
+        style += ", response path: " + CFG.embed_response_path
     lines.append("Embeddings endpoint   : {0} (style: {1}, model: {2}, key: {3})".format(
         CFG.embed_url, style, CFG.embed_model or "(none)",
         "set" if CFG.embed_key else "NOT SET"))
@@ -1326,6 +1438,22 @@ def main():
     parser.add_argument("--embed-json-key", default=env("KB_EMBED_JSON_KEY", "texts"),
                         help="raw-json style only: the JSON key the batch of texts is sent "
                              "under (env: KB_EMBED_JSON_KEY; default: texts).")
+    parser.add_argument("--embed-template", default=env("KB_EMBED_TEMPLATE", ""),
+                        help="Full request-body control: the complete JSON body to POST, "
+                             "with the string \"__TEXTS__\" where the array of texts goes "
+                             "(and optional \"__MODEL__\"). Overrides --embed-style's "
+                             "request shape; batching still applies. Example: "
+                             "{\"inputs\": {\"texts\": \"__TEXTS__\"}} "
+                             "(env: KB_EMBED_TEMPLATE).")
+    parser.add_argument("--embed-response-path", default=env("KB_EMBED_RESPONSE_PATH", ""),
+                        help="Dotted path to the vectors in the embeddings response when "
+                             "auto-detection can't find them, e.g. 'outputs.embeddings' or "
+                             "'result.0.vectors'; numeric parts index lists "
+                             "(env: KB_EMBED_RESPONSE_PATH).")
+    parser.add_argument("--debug", action="store_true",
+                        default=os.environ.get("KB_DEBUG", "").strip().lower() in {"1", "true", "yes"},
+                        help="Log every request and response body (truncated) to stderr, to "
+                             "see exactly what is sent to an unknown endpoint (env: KB_DEBUG=1).")
     parser.add_argument("--embed-batch", type=int, default=int(env("KB_EMBED_BATCH", "16")),
                         help="Texts per embeddings request, openai style (env: KB_EMBED_BATCH; default: 16).")
     parser.add_argument("--embed-query-prefix", default=env("KB_EMBED_QUERY_PREFIX", ""),
@@ -1418,6 +1546,19 @@ def main():
     CFG.embed_style = args.embed_style
     CFG.embed_tensor_name = args.embed_tensor_name
     CFG.embed_json_key = args.embed_json_key
+    if args.embed_template:
+        try:
+            CFG.embed_template = json.loads(args.embed_template)
+        except ValueError as exc:
+            log("FATAL: --embed-template is not valid JSON ({0}): {1}".format(
+                exc, args.embed_template))
+            sys.exit(2)
+        if count_template_placeholders(CFG.embed_template) == 0:
+            log("FATAL: --embed-template must contain the JSON string \"{0}\" "
+                "where the array of texts goes.".format(TEMPLATE_TEXTS))
+            sys.exit(2)
+    CFG.embed_response_path = args.embed_response_path
+    CFG.debug = args.debug
     CFG.embed_batch = max(1, args.embed_batch)
     CFG.embed_query_prefix = args.embed_query_prefix
     CFG.embed_doc_prefix = args.embed_doc_prefix

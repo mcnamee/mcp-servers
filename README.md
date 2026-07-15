@@ -18,7 +18,7 @@ for the bump rules.
 | `confluence.py` | 1.3.0 | _none_ | standard library only |
 | `jira.py` | 1.1.0 | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
 | `knowledge-base.py` | 2.0.0 | _none_ | standard library only (keyword search) |
-| `knowledge-base-rag.py` | 1.3.0 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
+| `knowledge-base-rag.py` | 1.4.0 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
 | `ms-excel.py` | 2.1.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
 | `ms-word.py` | 2.1.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
 | `ms-outlook.py` | 1.5.1 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
@@ -267,6 +267,9 @@ that is what RAG is — so point it only at material appropriate for those APIs.
 | `KB_EMBED_STYLE` | `--embed-style` | Request format: `openai` (default; batch `{"input": [...]}`), `ollama` (`{"prompt": ...}` one-per-request), or `kserve-jina` (KServe V2 Open Inference Protocol — texts sent as a BYTES input tensor `{"inputs": [{"name", "shape", "datatype", "data"}]}`, e.g. a Jina embeddings model served on KServe; the model name is part of the `--embed-url` path such as `https://host/v2/models/jina-embeddings/infer`, and flat FP32 output tensors are reshaped via their `shape`; nested data and KServe V1 `predictions` responses also parsed), or `raw-json` (plain `{"texts": [...]}` body — for KServe **custom** predictors and other bespoke wrappers that unpack the raw request body into their pipeline's arguments; the telltale symptom is a server error like `pipeline() missing 1 required positional argument: 'texts'` that doesn't change when the tensor name does). Response parsing additionally accepts bare `embedding`/`embeddings` shapes, so most bespoke internal endpoints work unchanged |
 | `KB_EMBED_TENSOR_NAME` | `--embed-tensor-name` | `kserve-jina` style only: name of the input tensor the texts are sent as (default `text`) |
 | `KB_EMBED_JSON_KEY` | `--embed-json-key` | `raw-json` style only: the JSON key the batch of texts is sent under (default `texts`; e.g. `instances` for a V1-flavoured custom wrapper) |
+| `KB_EMBED_TEMPLATE` | `--embed-template` | **Full request-body control** when none of the styles matches your endpoint: the complete JSON body to POST, with the JSON string `"__TEXTS__"` where the array of texts goes (and optional `"__MODEL__"`). Overrides the style's request shape; batching still applies. E.g. a FastAPI custom predictor that validates `{"inputs": {"texts": [...]}}` (symptom: HTTP 422 with `loc: [body, inputs]`) is `KB_EMBED_TEMPLATE={"inputs": {"texts": "__TEXTS__"}}` |
+| `KB_EMBED_RESPONSE_PATH` | `--embed-response-path` | Dotted path to the vectors in the response when auto-detection can't find them, e.g. `outputs.embeddings` or `result.0.vectors` (numeric parts index lists). Applies to every style |
+| `KB_DEBUG=1` | `--debug` | Log every request/response body (truncated) to stderr — run `--check` with it to see exactly what is sent and what came back, for matching an unknown endpoint |
 | `KB_EMBED_BATCH` | `--embed-batch` | Texts per embeddings request, openai and kserve-jina styles (default 16) |
 | `KB_EMBED_QUERY_PREFIX` | `--embed-query-prefix` | Prefix for query embeds, for models that need it (e5-style `"query: "`) |
 | `KB_EMBED_DOC_PREFIX` | `--embed-doc-prefix` | Prefix for document embeds (`"passage: "`) |
