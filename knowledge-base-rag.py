@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-knowledge-base-rag.py (v1.4.0)
+knowledge-base-rag.py (v1.5.0)
 ==============================
 
 A single-file MCP (Model Context Protocol) server providing true RAG
@@ -61,8 +61,10 @@ ONLY (command lines are visible to other local users in process listings).
 | KB_EMBED_TENSOR_NAME    | --embed-tensor-name  | kserve-jina only: name of the input tensor (default: text)  |
 | KB_EMBED_JSON_KEY       | --embed-json-key     | raw-json only: key the texts are sent under (default: texts)|
 | KB_EMBED_TEMPLATE       | --embed-template     | FULL request-body control: a JSON document with "__TEXTS__" |
-|                         |                      | where the array of texts goes (and optional "__MODEL__").   |
-|                         |                      | When set it OVERRIDES --embed-style's request shape. E.g.   |
+|                         |                      | where the array of texts goes; "__COUNT__" becomes the      |
+|                         |                      | number of texts in the batch (for tensor "shape" fields)    |
+|                         |                      | and "__MODEL__" the --embed-model name. When set it         |
+|                         |                      | OVERRIDES --embed-style's request shape. E.g.               |
 |                         |                      | {"inputs": {"texts": "__TEXTS__"}} for a FastAPI wrapper    |
 |                         |                      | that nests the pipeline arguments under an "inputs" field   |
 | KB_EMBED_RESPONSE_PATH  | --embed-response-path| Dotted path to the vectors in the response when the         |
@@ -136,6 +138,13 @@ Endpoint formats ("where you have unknowns"):
                               {"inputs": {"texts": [...]}} (the symptom is an
                               HTTP 422 with loc [body, inputs]) is:
                                 KB_EMBED_TEMPLATE={"inputs": {"texts": "__TEXTS__"}}
+                              "__COUNT__" is replaced by the number of texts
+                              in the batch, so even a strictly-validated V2
+                              tensor envelope with extra custom fields can be
+                              expressed, e.g.:
+                                {"inputs": [{"name": "texts",
+                                 "shape": ["__COUNT__"], "datatype": "BYTES",
+                                 "data": "__TEXTS__", "texts": "__TEXTS__"}]}
   Response parsing also falls back to top-level "embedding"/"embeddings",
   so most bespoke internal endpoints work with style=openai unchanged. If
   the vectors sit somewhere the auto-detection can't see (e.g. under
@@ -208,7 +217,7 @@ NOTES
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import os
 import re
@@ -457,12 +466,15 @@ def http_post_json(url, payload, headers):
 
 TEMPLATE_TEXTS = "__TEXTS__"
 TEMPLATE_MODEL = "__MODEL__"
+TEMPLATE_COUNT = "__COUNT__"
 
 
 def fill_template(node, texts):
     """
     Deep-copy the request template, substituting the "__TEXTS__" placeholder
-    with the list of texts and "__MODEL__" with the configured model name.
+    with the list of texts, "__COUNT__" with how many texts there are (an
+    integer - for tensor "shape" fields), and "__MODEL__" with the
+    configured model name.
     """
     if isinstance(node, dict):
         return {key: fill_template(value, texts) for key, value in node.items()}
@@ -470,6 +482,8 @@ def fill_template(node, texts):
         return [fill_template(value, texts) for value in node]
     if node == TEMPLATE_TEXTS:
         return texts
+    if node == TEMPLATE_COUNT:
+        return len(texts)
     if node == TEMPLATE_MODEL:
         return CFG.embed_model
     return node
@@ -1441,9 +1455,10 @@ def main():
     parser.add_argument("--embed-template", default=env("KB_EMBED_TEMPLATE", ""),
                         help="Full request-body control: the complete JSON body to POST, "
                              "with the string \"__TEXTS__\" where the array of texts goes "
-                             "(and optional \"__MODEL__\"). Overrides --embed-style's "
-                             "request shape; batching still applies. Example: "
-                             "{\"inputs\": {\"texts\": \"__TEXTS__\"}} "
+                             "(\"__COUNT__\" becomes the number of texts, for tensor "
+                             "shape fields; \"__MODEL__\" the model name). Overrides "
+                             "--embed-style's request shape; batching still applies. "
+                             "Example: {\"inputs\": {\"texts\": \"__TEXTS__\"}} "
                              "(env: KB_EMBED_TEMPLATE).")
     parser.add_argument("--embed-response-path", default=env("KB_EMBED_RESPONSE_PATH", ""),
                         help="Dotted path to the vectors in the embeddings response when "
