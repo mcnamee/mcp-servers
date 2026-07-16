@@ -1,6 +1,6 @@
 ---
 name: ms-word
-description: Read, edit and create Word .docx files via the msword MCP server, including Word tracked changes and creating documents from a template. Use when the user asks to open/summarise/search a Word document, edit or redline one with tracked changes, accept/reject revisions, or draft a new .docx (optionally from a template).
+description: Read, edit and create Word .docx files via the msword MCP server, including Word tracked changes, editing tables (set cells, add/delete rows), and creating documents from a template — including filling out an example template (placeholders + example tables). Use when the user asks to open/summarise/search a Word document, edit or redline one with tracked changes, accept/reject revisions, fill in or edit tables, or draft a new .docx (optionally from a template).
 ---
 
 # Word (via the `msword-py` MCP server)
@@ -57,6 +57,37 @@ boilerplate, etc.), pass `template` to `msword_create`:
 - To discover available templates, use `msword_list_documents` (e.g.
   `query: "template"`); keep templates in the docs folder (a `templates/`
   subfolder is a tidy convention). Only `.docx` templates are supported.
+
+### Filling out a template (placeholders + example tables)
+
+When the template is an *example* to fill in (e.g. an agenda with placeholder
+text and an example items table), after `msword_create(template=...)`:
+
+1. **See what's there:** `msword_get_content` with `mode: "structured"` (shows
+   each table's `table_index`, `rows`, `cols` in order) and `msword_get_tables`
+   (shows every cell's text). Identify the placeholders, the repeating table,
+   its header row and its example rows.
+2. **Text placeholders:** `msword_replace_text` to swap them (works inside table
+   cells too). Templates are easiest to fill when they use explicit
+   `{{TOKEN}}` markers (e.g. `{{MEETING_DATE}}`, `{{CHAIR}}`), which make the
+   `find` unambiguous. If the template just has example prose, use that example
+   text as the `find` string — or, when example values repeat, set the cell by
+   coordinate with `msword_set_cell` instead.
+3. **Grow the table:** for each real item, `msword_add_table_row` with
+   `table_index`, `copy_from_row` = a styled example data row (so borders,
+   shading and fonts are inherited), and `values` = the row's cell texts. Or add
+   the row and fill cells individually with `msword_set_cell`
+   (`table_index`, `row`, `col`, `text`). New rows are always appended last.
+4. **Remove leftover example rows:** `msword_delete_table_row`. **Row indices
+   shift after each delete**, so delete from the highest index down (or re-read
+   `msword_get_tables` between deletes). Never delete the header row unless you
+   mean to; the only remaining row can't be deleted.
+5. **Save:** `msword_save`.
+
+These table edits are always plain (untracked) — table row/cell changes can't be
+recorded as Word tracked changes. `values` maps to *cells* left-to-right, so a
+row with horizontally merged cells has fewer cells than grid columns; passing
+more values than the row has cells is an error.
 
 ## Notes
 

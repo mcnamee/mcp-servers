@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-ms-word.py (v2.2.0) - A single-file MCP (Model Context Protocol) stdio server
+ms-word.py (v2.3.0) - A single-file MCP (Model Context Protocol) stdio server
 that gives an AI agent read/search/edit/generate access to Word .docx files.
 
 It follows a simple open -> edit -> save workflow (msword_open ... msword_save),
@@ -41,6 +41,9 @@ WHAT IT CAN DO
     - Read/search the FINAL view while changes are pending (like Word's
       "No Markup"): pending insertions are visible, pending deletions hidden.
     - Append paragraphs, headings and tables; insert paragraphs anywhere.
+    - Edit existing tables: set a cell by (table, row, col), add a row (optionally
+      cloning a styled example row's formatting), and delete a row - enough to
+      fill out a template's example table (e.g. one row per agenda item).
     - Apply simple paragraph formatting (bold/italic/underline/alignment/style).
     - Save in place, or save-as to a new path.
 
@@ -184,7 +187,7 @@ failed transfer" rule):
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # =============================================================================
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
@@ -1984,6 +1987,132 @@ def tool_get_tables(args):
     ]}
 
 
+def _get_table(doc, args):
+    """Fetch a table by the required 'table_index' argument, bounds-checked."""
+    ti = int(_require(args, "table_index"))
+    if not 0 <= ti < len(doc.tables):
+        raise ToolError("table_index out of range (0..{})".format(len(doc.tables) - 1))
+    return ti, doc.tables[ti]
+
+
+def _write_cell_text(cell, text):
+    """
+    Set a cell's text WITHOUT destroying its run/paragraph formatting.
+
+    Unlike `cell.text = value` (which drops all but the first paragraph and
+    writes a single unformatted run), this writes into the FIRST run of the
+    first paragraph - preserving that run's bold/font/size/colour - and blanks
+    every other run, and clears the text of any further paragraphs. This keeps a
+    styled example cell's look when it is filled. Paragraph elements are left in
+    place (a table cell must always contain at least one paragraph); only their
+    text is cleared.
+    """
+    text = "" if text is None else str(text)
+    paras = cell.paragraphs
+    first = paras[0]
+    if first.runs:
+        first.runs[0].text = text
+        for r in first.runs[1:]:
+            r.text = ""
+    else:
+        first.add_run(text)
+    for p in paras[1:]:            # clear leftover example lines in multi-para cells
+        for r in p.runs:
+            r.text = ""
+
+
+def tool_set_cell(args):
+    session = _get_session(args)
+    doc = session["doc"]
+    ti, table = _get_table(doc, args)
+    row = int(_require(args, "row"))
+    if not 0 <= row < len(table.rows):
+        raise ToolError("row out of range (0..{})".format(len(table.rows) - 1))
+    cells = table.rows[row].cells
+    col = int(_require(args, "col"))
+    if not 0 <= col < len(cells):
+        raise ToolError(
+            "col out of range (0..{}) for row {}".format(len(cells) - 1, row))
+    text = _require(args, "text")   # "" is allowed and clears the cell
+    _write_cell_text(cells[col], text)
+    return {"table_index": ti, "row": row, "col": col,
+            "text": "" if text is None else str(text)}
+
+
+def tool_add_table_row(args):
+    session = _get_session(args)
+    doc = session["doc"]
+    ti, table = _get_table(doc, args)
+    values = args.get("values")
+    if values is not None and not isinstance(values, list):
+        raise ToolError("'values' must be a list of cell strings")
+    copy_from = args.get("copy_from_row")
+
+    # Work out how many cells the new row will have, and validate `values`
+    # BEFORE mutating the table - so a bad call cannot leave a stray empty row.
+    if copy_from is not None:
+        copy_from = int(copy_from)
+        if not 0 <= copy_from < len(table.rows):
+            raise ToolError(
+                "copy_from_row out of range (0..{})".format(len(table.rows) - 1))
+        target_cells = len(table.rows[copy_from].cells)
+    else:
+        target_cells = len(table.columns)
+    if values is not None and len(values) > target_cells:
+        raise ToolError(
+            "values has {} entries but the row has {} cell(s).".format(
+                len(values), target_cells))
+
+    if copy_from is not None:
+        # Clone the source row's XML so cell borders/shading/widths and run
+        # formatting are preserved, then append it as the new last row.
+        new_tr = copy.deepcopy(table.rows[copy_from]._tr)
+        # A cloned vertical-merge (w:vMerge) cell would try to continue a merge
+        # from the row above and corrupt the new standalone row - strip them.
+        for vm in list(new_tr.iter(qn("w:vMerge"))):
+            vm.getparent().remove(vm)
+        table._tbl.append(new_tr)
+        new_row = table.rows[-1]
+        for cell in new_row.cells:   # drop the cloned example text
+            _write_cell_text(cell, "")
+        cloned_from = copy_from
+    else:
+        new_row = table.add_row()
+        cloned_from = None
+
+    cells = new_row.cells
+    values_set = 0
+    if values is not None:
+        for c_i, val in enumerate(values):
+            _write_cell_text(cells[c_i], val)
+            values_set += 1
+
+    return {
+        "table_index": ti,
+        "row": len(table.rows) - 1,
+        "cols": len(cells),
+        "cloned_from": cloned_from,
+        "values_set": values_set,
+    }
+
+
+def tool_delete_table_row(args):
+    session = _get_session(args)
+    doc = session["doc"]
+    ti, table = _get_table(doc, args)
+    row = int(_require(args, "row"))
+    if not 0 <= row < len(table.rows):
+        raise ToolError("row out of range (0..{})".format(len(table.rows) - 1))
+    if len(table.rows) == 1:
+        raise ToolError(
+            "Cannot delete the only remaining row (a table must keep at least "
+            "one). Delete the whole table instead, or leave one row.")
+    tr = table.rows[row]._tr
+    tr.getparent().remove(tr)
+    return {"table_index": ti, "deleted_row": row,
+            "remaining_rows": len(table.rows)}
+
+
 # Accept both US and Australian spellings of "centre".
 _ALIGN_MAP = {
     "left": WD_ALIGN_PARAGRAPH.LEFT,
@@ -2344,6 +2473,55 @@ TOOLS = [
                 "table_index": {"type": "integer"},
             },
             "required": ["session_id"],
+        },
+    },
+    {
+        "name": "msword_set_cell",
+        "description": "Set the text of ONE cell in an existing table, addressed by table_index (from msword_get_content structured or msword_get_tables), 0-based row and 0-based col. Preserves the cell's existing formatting (writes into its first run); an empty text clears the cell. This is a plain (untracked) edit - table cell/row changes are not recorded as Word tracked changes.",
+        "handler": tool_set_cell,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "table_index": {"type": "integer"},
+                "row": {"type": "integer", "description": "0-based row index."},
+                "col": {"type": "integer", "description": "0-based column (cell) index within the row."},
+                "text": {"type": "string", "description": "New cell text ('' clears it)."},
+            },
+            "required": ["session_id", "table_index", "row", "col", "text"],
+        },
+    },
+    {
+        "name": "msword_add_table_row",
+        "description": "Append a new row to an EXISTING table (by table_index) and optionally fill it. Use this to grow a template's example table - e.g. one row per real agenda item. Pass 'copy_from_row' (a 0-based row index) to CLONE that row's formatting (cell borders, shading, widths and fonts) so the new row matches a styled example row; the cloned example text is cleared first. Pass 'values' (left-to-right cell strings) to fill the row; fewer values than cells leaves the rest empty, more values than cells is an error. The row is always added last (delete leftover example rows afterwards to get the final order). Values map to CELLS, so a row with horizontally merged cells has fewer cells than grid columns. Plain (untracked) edit.",
+        "handler": tool_add_table_row,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "table_index": {"type": "integer"},
+                "values": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Cell texts, left to right. Optional.",
+                },
+                "copy_from_row": {"type": "integer", "description": "Optional 0-based row to clone formatting from (e.g. a styled example row)."},
+            },
+            "required": ["session_id", "table_index"],
+        },
+    },
+    {
+        "name": "msword_delete_table_row",
+        "description": "Delete one row from an existing table by table_index and 0-based row index - e.g. to remove leftover example rows after filling a template. Note row indices shift after each delete, so delete from the highest index down (or re-read msword_get_tables between deletes). Deleting the only remaining row is refused (a table must keep at least one). There is no header protection - which row is a header is your responsibility. Plain (untracked) edit.",
+        "handler": tool_delete_table_row,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "table_index": {"type": "integer"},
+                "row": {"type": "integer", "description": "0-based row index to delete."},
+            },
+            "required": ["session_id", "table_index", "row"],
         },
     },
     {
@@ -3071,6 +3249,121 @@ def run_check():
         tool_close({"session_id": mres["session_id"]})
         KB_DIR = None
         print("[check] markdown-export / kb-mirror: PASS")
+
+        # --- Template fill: set_cell / add_table_row / delete_table_row ------
+        # A template with a {{TITLE}} placeholder and an example agenda table
+        # (header + 2 example rows); fill it out and confirm the result.
+        tf_path = os.path.join(tmpdir, "Agenda Template.docx")
+        tf = docx.Document()
+        tf.add_paragraph("{{TITLE}}")
+        tbl = tf.add_table(rows=3, cols=3)
+        tbl.style = "Table Grid"
+        for c, h in enumerate(["Time", "Item", "Owner"]):
+            tbl.rows[0].cells[c].text = h
+        tbl.rows[1].cells[0].text = "09:00"
+        tbl.rows[1].cells[1].text = "Example item"
+        tbl.rows[1].cells[2].text = "Example owner"
+        tbl.rows[2].cells[0].text = "09:30"
+        tbl.rows[2].cells[1].text = "Another example"
+        tbl.rows[2].cells[2].text = "Someone"
+        # Explicit run formatting on an example cell, to prove cloning + the
+        # formatting-preserving cell writer keep it.
+        tbl.rows[1].cells[0].paragraphs[0].runs[0].bold = True
+        tf.save(tf_path)
+
+        tfo = tool_open({"path": tf_path})
+        tsid = tfo["session_id"]
+        # Text placeholder swap (works inside body paragraphs).
+        assert tool_replace_text({"session_id": tsid, "find": "{{TITLE}}",
+                                  "replace": "Weekly Sync"})["replacements"] == 1
+        # Add two real rows, cloning the styled example row (index 1).
+        r_a = tool_add_table_row({"session_id": tsid, "table_index": 0,
+                                  "copy_from_row": 1,
+                                  "values": ["10:00", "Kickoff", "Matt"]})
+        assert r_a["cols"] == 3 and r_a["cloned_from"] == 1, r_a
+        r_b = tool_add_table_row({"session_id": tsid, "table_index": 0,
+                                  "copy_from_row": 1, "values": ["10:30", "Review"]})
+        assert r_b["values_set"] == 2, r_b
+        # Fill the owner the second add left empty, by coordinate.
+        sc = tool_set_cell({"session_id": tsid, "table_index": 0,
+                            "row": r_b["row"], "col": 2, "text": "Alice"})
+        assert sc["text"] == "Alice"
+        # Overflow, bounds and last-row guard all error.
+        for bad in ({"table_index": 0, "values": ["a", "b", "c", "d"]},
+                    {"table_index": 9}):
+            try:
+                tool_add_table_row(dict(bad, session_id=tsid))
+                raise AssertionError("expected ToolError for {}".format(bad))
+            except ToolError:
+                pass
+        try:
+            tool_set_cell({"session_id": tsid, "table_index": 0, "row": 0,
+                           "col": 9, "text": "x"})
+            raise AssertionError("expected col-out-of-range error")
+        except ToolError:
+            pass
+        # Delete the two example rows (indices 1 and 2) - highest first.
+        tool_delete_table_row({"session_id": tsid, "table_index": 0, "row": 2})
+        dr = tool_delete_table_row({"session_id": tsid, "table_index": 0, "row": 1})
+        assert dr["remaining_rows"] == 3, dr  # header + 2 real rows
+
+        tf_out = os.path.join(tmpdir, "Weekly Sync.docx")
+        tool_save({"session_id": tsid, "path": tf_out})
+        tool_close({"session_id": tsid})
+
+        # Reopen and confirm the filled result.
+        tfr = tool_open({"path": tf_out})
+        cells = tool_get_tables({"session_id": tfr["session_id"],
+                                 "table_index": 0})["cells"]
+        assert cells[0] == ["Time", "Item", "Owner"], "header changed: {}".format(cells[0])
+        assert ["10:00", "Kickoff", "Matt"] in cells, "added row missing: {}".format(cells)
+        assert ["10:30", "Review", "Alice"] in cells, "set_cell row wrong: {}".format(cells)
+        assert not any("Example" in c for row in cells for c in row), \
+            "example rows not removed: {}".format(cells)
+        body = tool_get_content({"session_id": tfr["session_id"],
+                                 "mode": "text"})["content"]
+        assert "Weekly Sync" in body and "{{TITLE}}" not in body
+        # Cloning + the formatting-preserving cell writer kept the example
+        # cell's bold run on the filled row.
+        added_cell = SESSIONS[tfr["session_id"]]["doc"].tables[0].rows[1].cells[0]
+        added_runs = added_cell.paragraphs[0].runs
+        assert added_runs and added_runs[0].bold, \
+            "cloned row lost its cell run formatting"
+        tool_close({"session_id": tfr["session_id"]})
+
+        # Last-remaining-row guard.
+        g_path = os.path.join(tmpdir, "one_row.docx")
+        gd = docx.Document()
+        gt = gd.add_table(rows=1, cols=1)
+        gt.rows[0].cells[0].text = "only"
+        gd.save(g_path)
+        gsid = tool_open({"path": g_path})["session_id"]
+        try:
+            tool_delete_table_row({"session_id": gsid, "table_index": 0, "row": 0})
+            raise AssertionError("expected only-row guard to fire")
+        except ToolError:
+            pass
+        tool_close({"session_id": gsid})
+        print("[check] template-fill: PASS")
+
+        # --- JSON-RPC smoke: new tools are registered and callable -----------
+        listed = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        assert {"msword_set_cell", "msword_add_table_row",
+                "msword_delete_table_row"} <= names, "new tools not in tools/list"
+        smoke_doc = os.path.join(tmpdir, "smoke.docx")
+        sd = docx.Document()
+        sd.add_table(rows=1, cols=2)
+        sd.save(smoke_doc)
+        ssid = tool_open({"path": smoke_doc})["session_id"]
+        resp = handle_message({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                               "params": {"name": "msword_add_table_row",
+                                          "arguments": {"session_id": ssid,
+                                                        "table_index": 0,
+                                                        "values": ["x", "y"]}}})
+        assert resp["result"]["isError"] is False, resp
+        tool_close({"session_id": ssid})
+        print("[check] jsonrpc-dispatch (table tools): PASS")
     except Exception as e:
         ok = False
         print("[check] round-trip: FAIL -> {}".format(e))
