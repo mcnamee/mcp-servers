@@ -34,7 +34,7 @@ repo README) and to verify connectivity with `python confluence.py --check`.
 
 - The server is read-only; it cannot create or edit pages.
 - If `--kb-dir` / `CONFLUENCE_KB_DIR` is configured, every page you read is
-  automatically mirrored to Markdown for the local knowledge-base servers —
+  automatically mirrored to Markdown for the local knowledge-base server —
   reading a page IS how you import it into the RAG index.
 - Long pages may be truncated in the returned text if `--max-body` is set;
   say so if an answer might sit past the truncation point.

@@ -17,10 +17,9 @@ for the bump rules.
 |---|---|---|---|
 | `confluence.py` | 1.3.0 | _none_ | standard library only |
 | `jira.py` | 1.1.0 | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
-| `knowledge-base.py` | 2.0.0 | _none_ | standard library only (keyword search) |
-| `knowledge-base-rag.py` | 1.5.0 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
+| `knowledge-base.py` | 2.0.0 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
 | `ms-excel.py` | 2.1.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
-| `ms-word.py` | 2.1.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
+| `ms-word.py` | 2.2.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
 | `ms-outlook.py` | 1.5.1 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
 | `pdf-to-md.py` | 4.0.0 | `pip install pymupdf pymupdf4llm` | OCR of scanned PDFs additionally requires Tesseract installed on the machine (not a pip package) |
 
@@ -43,7 +42,7 @@ you know them all:
 2. **Naming: the env var is the server's prefix + the flag name.**
    `--docs-dir` on `ms-excel.py` is `EXCEL_DOCS_DIR`; on `ms-word.py` it is
    `MSWORD_DOCS_DIR`; `--timeout` on `jira.py` is `JIRA_TIMEOUT`. Prefixes:
-   `CONFLUENCE_`, `JIRA_`, `KB_` (both knowledge-base servers), `EXCEL_`,
+   `CONFLUENCE_`, `JIRA_`, `KB_` (knowledge-base), `EXCEL_`,
    `OUTLOOK_`, `MSWORD_`, `PDF2MD_`. The one deliberate exception:
    `--insecure` pairs with `<PREFIX>_VERIFY_SSL=false`.
 3. **Secrets are env-var ONLY.** There are deliberately no
@@ -53,14 +52,14 @@ you know them all:
 4. **Common flag vocabulary across the suite:**
    - `--docs-dir` — the folder of source documents the server is confined to
      (workbooks for Excel, .docx sandbox for Word, PDFs for pdf-to-md,
-     markdown/text for the knowledge-base servers)
+     markdown/text for the knowledge-base server)
    - `--output-dir` — folder generated files are written to (`ms-word.py`,
      `pdf-to-md.py`)
    - `--kb-dir` — optional folder where read content is mirrored as Markdown
      for a local RAG knowledge base (`confluence.py`, `ms-outlook.py`,
      `ms-word.py`)
    - `--base-url`, `--ca-cert`, `--insecure`, `--timeout`, `--max-body` —
-     the HTTP servers (`confluence.py`, `jira.py`, `knowledge-base-rag.py`)
+     the HTTP servers (`confluence.py`, `jira.py`, `knowledge-base.py`)
    - `--check` — validate config/environment (and connectivity, for the HTTP
      servers) and exit without starting the server; run it first, before
      wiring a server into your MCP client
@@ -70,11 +69,14 @@ you know them all:
 > **Upgrading from an older checkout?** These names were standardized in the
 > v2.x/v4.x bumps: `ms-excel.py --folder`/`EXCEL_WORKBOOK_FOLDER` became
 > `--docs-dir`/`EXCEL_DOCS_DIR`, `ms-word.py --document-root`/
-> `MSWORD_DOCUMENT_ROOT` became `--docs-dir`/`MSWORD_DOCS_DIR`,
+> `MSWORD_DOCUMENT_ROOT` became `--docs-dir`/`MSWORD_DOCS_DIR`, and
 > `pdf-to-md.py --input-dir`/`PDF2MD_INPUT_DIR` became
-> `--docs-dir`/`PDF2MD_DOCS_DIR`, and `knowledge-base.py`'s
-> `REFERENCE_DOCS_DIR` became `KB_DOCS_DIR`. Update your client config when
-> you update the file.
+> `--docs-dir`/`PDF2MD_DOCS_DIR`. Also: the old standard-library keyword-search
+> `knowledge-base.py` has been removed, and the RAG server `knowledge-base-rag.py`
+> has taken its place as `knowledge-base.py` (ChromaDB vector index; its tools
+> are `kb_ask`/`kb_retrieve`/`kb_index`/`kb_status`, not the old
+> `reference_search`/`reference_get`). Update your client config when you update
+> the files.
 
 ## File access policy
 
@@ -86,8 +88,7 @@ refuse to start unconfined rather than fall back to "anywhere":
 |---|---|---|
 | `ms-word.py` | open/save only inside the docs folder (and the output folder, if set); new docs written to the output folder; Markdown mirrored to the knowledge-base folder | `--docs-dir` / `MSWORD_DOCS_DIR` / `DOCS_DIR` constant (required); optional `--output-dir` and `--kb-dir` |
 | `ms-excel.py` | reads only inside the workbook folder | `--docs-dir` / `EXCEL_DOCS_DIR` / `DOCS_DIR` constant |
-| `knowledge-base.py` | reads only inside the docs folder | `--docs-dir` / `KB_DOCS_DIR` |
-| `knowledge-base-rag.py` | reads only inside the docs folder; writes only the vector-index folder (default `<docs-dir>\.kb-rag-index`); network only to the endpoint(s) you configure | `--docs-dir` / `KB_DOCS_DIR` + `--embed-url` / `KB_EMBED_URL` |
+| `knowledge-base.py` | reads only inside the docs folder; writes only the vector-index folder (default `<docs-dir>\.kb-rag-index`); network only to the endpoint(s) you configure | `--docs-dir` / `KB_DOCS_DIR` + `--embed-url` / `KB_EMBED_URL` |
 | `pdf-to-md.py` | reads only the docs folder, writes only the output folder | `--docs-dir` + `--output-dir` (or `PDF2MD_DOCS_DIR`/`PDF2MD_OUTPUT_DIR`) |
 | `confluence.py` | no local file access unless `CONFLUENCE_KB_DIR` is set; then writes only inside that folder | n/a (mirroring is optional; unset = no file access) |
 | `jira.py` | no local file access (HTTP GET to Jira only; reads the optional `JIRA_CA_CERT` bundle once at startup) | n/a |
@@ -201,30 +202,6 @@ mcpServers:
 
 ### knowledge-base.py
 
-| CLI flag | Purpose |
-|---|---|
-| `--docs-dir` | Folder of reference docs to expose (`.md`/`.markdown`/`.txt`), searched recursively. Falls back to the `KB_DOCS_DIR` env var (deliberately shared with `knowledge-base-rag.py` — set env per server entry if the two should use different folders) |
-| `--check` | List the folder's documents to stderr, then exit (no server) |
-| `--version` | Print version and exit |
-
-```yaml
-mcpServers:
-  - name: reference
-    command: python
-    args:
-      - C:\path\to\knowledge-base.py
-      - --docs-dir
-      - C:\reference-docs
-    env:
-      PYTHONUTF8: "1"
-```
-
-> For true vector (RAG) retrieval over the same kind of folder, see
-> `knowledge-base-rag.py` below. You can run both at once (different
-> `name:` and folder).
-
-### knowledge-base-rag.py
-
 True RAG (Retrieval-Augmented Generation) over a folder of your own markdown
 files, in three stages:
 
@@ -302,10 +279,10 @@ of the file walks through it. If you change embedding model, run
 
 ```yaml
 mcpServers:
-  - name: kb-rag
+  - name: knowledge-base
     command: C:\path\to\python.exe
     args:
-      - C:\path\to\knowledge-base-rag.py
+      - C:\path\to\knowledge-base.py
       - --docs-dir
       - C:\Users\me\knowledge-base
       - --embed-url
@@ -396,8 +373,8 @@ mcpServers:
 
 `--kb-dir` is optional — drop those two lines to keep the server file-free
 (no emails written to disk). When set, point it at the same folder your
-knowledge-base servers (`knowledge-base.py` / `knowledge-base-rag.py`) index so
-read emails land alongside your Confluence pages and Word documents.
+`knowledge-base.py` server indexes so read emails land alongside your
+Confluence pages and Word documents.
 
 ### ms-word.py
 
@@ -426,18 +403,28 @@ rather than guessing. Use **`msword_list_documents`** (optionally with a
 path, size and modified time — when you're unsure of the exact name.
 
 **Building a RAG knowledge base.** Point `--kb-dir` at the same folder your
-knowledge-base servers (`knowledge-base.py` / `knowledge-base-rag.py`)
-index. Each time a `.docx` is opened, a Markdown copy is dropped there —
-headings become `#`/`##`, `List Bullet`/`List Number` paragraphs become `-`/`1.`
-lists, and tables become GitHub-style pipe tables — so Word content lands
-alongside the Confluence pages in the same RAG index.
+`knowledge-base.py` server indexes. Each time a `.docx` is opened, a Markdown
+copy is dropped there — headings become `#`/`##`, `List Bullet`/`List Number`
+paragraphs become `-`/`1.` lists, and tables become GitHub-style pipe tables —
+so Word content lands alongside the Confluence pages in the same RAG index.
 
-**Creating documents.** `msword_create` makes a new blank `.docx` in the
+**Creating documents.** `msword_create` makes a new `.docx` in the
 `--output-dir` folder (falling back to the document root) and opens it as a
 session; build it up with `msword_add_heading` / `msword_add_paragraph` /
 `msword_add_table` and persist with `msword_save` (omit its `path` to save in
 place). Any directory part in the requested filename is stripped, so new files
 always land inside the output folder.
+
+**From a template.** Pass `template` to `msword_create` to base the new
+document on an existing one — a corporate letterhead, report layout or contract
+boilerplate. The template is a `.docx` in the document root, named the same
+forgiving way as `msword_open` (bare name, relative path, or a fuzzy near-miss,
+e.g. `template: "Report Template.docx"`); its styles, headers/footers, page
+setup and boilerplate are inherited into the new file, which is written to the
+output folder. **The template file itself is never modified**, and the result
+includes the resolved `template` so you can confirm the right one was used.
+`.docx` templates only; keep them in the docs folder (a `templates/` subfolder
+is a tidy convention, discoverable via `msword_list_documents`).
 
 Tracked changes are recorded the way Word itself records them: replacements
 are diffed **word-by-word** (only the words that actually change are marked
@@ -540,20 +527,10 @@ don't use, and adjust paths):
       "disabled": false,
       "autoApprove": []
     },
-    "reference": {
+    "knowledge-base": {
       "command": "C:\\path\\to\\python.exe",
       "args": [
         "C:\\path\\to\\knowledge-base.py",
-        "--docs-dir", "C:\\reference-docs"
-      ],
-      "env": { "PYTHONUTF8": "1" },
-      "disabled": false,
-      "autoApprove": []
-    },
-    "kb-rag": {
-      "command": "C:\\path\\to\\python.exe",
-      "args": [
-        "C:\\path\\to\\knowledge-base-rag.py",
         "--docs-dir", "C:\\Users\\me\\knowledge-base",
         "--embed-url", "https://ai-gateway.internal.example.com/v1/embeddings",
         "--embed-model", "text-embedding-3-small"
@@ -643,7 +620,7 @@ one or more of the tools the server exposes.
 3. "Pull up the full content of Confluence page 393217." → `confluence_get_page`
 4. "Open the 'Q3 Roadmap' page in the PROD space and summarise it." → `confluence_get_page_by_title`
 5. "List every page under the 'Engineering Handbook' in the DOCS space, direct children only." → `confluence_list_pages_under`
-6. "Pull the onboarding runbook into our local knowledge base for offline search." → `confluence_get_page` (or `confluence_get_page_by_title`), automatically mirrored to Markdown when `--kb-dir`/`CONFLUENCE_KB_DIR` is configured, so `knowledge-base.py`'s `reference_search`/`reference_get` can find it afterwards
+6. "Pull the onboarding runbook into our local knowledge base for offline search." → `confluence_get_page` (or `confluence_get_page_by_title`), automatically mirrored to Markdown when `--kb-dir`/`CONFLUENCE_KB_DIR` is configured, so `knowledge-base.py`'s `kb_index`/`kb_ask` can find it afterwards
 
 ### jira.py
 
@@ -656,13 +633,6 @@ one or more of the tools the server exposes.
 7. "Draft a status report from my open tickets as a Word doc with tracked changes." → `jira_my_issues` + `ms-word.py`'s editing tools
 
 ### knowledge-base.py
-
-1. "What reference documents do we have available?" → `reference_list`
-2. "Find any reference material about our procurement policy." → `reference_search`
-3. "Read the full expense-reporting policy document and tell me the approval limits." → `reference_get`
-4. "Search our reference docs for anything about onboarding, then read whichever one covers IT equipment." → `reference_search` followed by `reference_get`
-
-### knowledge-base-rag.py
 
 1. "Using my knowledge base, can I extend my work trip by 2 days, pay for my own accommodation for the weekend, and fly back Monday?" → `kb_ask` (retrieves the travel policy's trip-extension chunks and generates a cited answer — or hands the agent the chunks to answer from, if no chat endpoint is configured)
 2. "Find the parts of our policies about accommodation and per diem." → `kb_retrieve`
@@ -684,7 +654,7 @@ one or more of the tools the server exposes.
 1. "Show me my 10 most recent unread emails." → `outlook_list_recent_emails`
 2. "Search my inbox for anything from 'Jane Smith' about the contract renewal." → `outlook_search_emails`
 3. "Open that email from the vendor and summarise the key dates." → `outlook_get_email`
-4. "Read these project emails so they get saved into my RAG knowledge base as Markdown." → `outlook_get_email` with `--kb-dir` set (each cleared email is written to `Email - <date> - <subject> (<id>).md` for `knowledge-base.py` / `knowledge-base-rag.py` to index)
+4. "Read these project emails so they get saved into my RAG knowledge base as Markdown." → `outlook_get_email` with `--kb-dir` set (each cleared email is written to `Email - <date> - <subject> (<id>).md` for `knowledge-base.py` to index)
 5. "What's on my calendar for the next 7 days?" → `outlook_get_calendar`
 6. "What did I send last week?" → `outlook_list_sent_emails`
 7. "Find everything about the 'Acme renewal' across my Inbox, Sent Items and Archive from the last month." → `outlook_search_recent`
@@ -695,10 +665,11 @@ one or more of the tools the server exposes.
 
 1. "Edit the Word file Policy 103.docx to…" → `msword_open` with `path: "Policy 103.docx"` (resolved against the document root — no absolute path needed) + the editing tools
 2. "Open the budget policy doc." (name not exact) → `msword_open` with `path: "budget policy"` (fuzzy-matches `Budget Policy 2024.docx`; the result flags `fuzzy_matched` so you can confirm)
-4. "What Word documents do I have?" / "I'm not sure of the exact file name." → `msword_list_documents` (optionally with a `query`), then `msword_open` on the one you want
-5. "Open the proposal.docx and show me its full text." → `msword_open` + `msword_get_content`
-6. "Open every .docx in my docs folder so it gets mirrored into the RAG knowledge base as Markdown." → `msword_open` with `--kb-dir` set (each open writes `Word - <name>.md` next to the Confluence pages for `knowledge-base.py` / `knowledge-base-rag.py` to index)
-7. "Create a new status report document and draft it with a title, headings and a summary table, then save it to my generated-docs folder." → `msword_create` (writes to `--output-dir`) + `msword_add_heading` + `msword_add_paragraph` + `msword_add_table` + `msword_save`
+3. "What Word documents do I have?" / "I'm not sure of the exact file name." → `msword_list_documents` (optionally with a `query`), then `msword_open` on the one you want
+4. "Open the proposal.docx and show me its full text." → `msword_open` + `msword_get_content`
+5. "Open every .docx in my docs folder so it gets mirrored into the RAG knowledge base as Markdown." → `msword_open` with `--kb-dir` set (each open writes `Word - <name>.md` next to the Confluence pages for `knowledge-base.py` to index)
+6. "Create a new status report document and draft it with a title, headings and a summary table, then save it to my generated-docs folder." → `msword_create` (writes to `--output-dir`) + `msword_add_heading` + `msword_add_paragraph` + `msword_add_table` + `msword_save`
+7. "Create a Q3 report from my report template." → `msword_create` with `template: "Report Template.docx"` (inherits the template's styles/headers/boilerplate into a new file in the output folder; the template is left untouched) + the add_* tools + `msword_save`
 8. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
 9. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
 10. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
@@ -718,40 +689,39 @@ one or more of the tools the server exposes.
 1. "Convert every PDF in the reference folder to Markdown." → `convert_all_pdfs`
 2. "Convert just the 'procurement policy' PDF to Markdown." → `convert_pdf_to_markdown`
 3. "Reconvert all PDFs to Markdown even though some already have a .md file, since the source PDFs changed." → `convert_all_pdfs` with `force=true`
-4. "Convert all our compliance PDFs (including those in sub-folders) to Markdown so the knowledge-base server can search them." → `convert_all_pdfs` (with `--recursive` set at startup) feeding into `knowledge-base.py`'s `reference_search`
+4. "Convert all our compliance PDFs (including those in sub-folders) to Markdown so the knowledge-base server can search them." → `convert_all_pdfs` (with `--recursive` set at startup) feeding into `knowledge-base.py`'s `kb_index` / `kb_ask`
 
 ## Skills (slash commands for each MCP)
 
 The [`skills/`](skills/) folder contains one Claude skill per server —
-`skills/<server>/SKILL.md` with YAML frontmatter (`name`, `description`) and
+`skills/<server>.md` with YAML frontmatter (`name`, `description`) and
 a body that teaches an agent the server's tools, the right call order, and
 the sharp edges (read-only limits, sandboxes, tracked-changes workflow,
 when to reindex, …). Available skills:
 
 | Skill | Slash command | Backing server |
 |---|---|---|
-| `skills/confluence` | `/confluence` | `confluence.py` |
-| `skills/jira` | `/jira` | `jira.py` |
-| `skills/knowledge-base` | `/knowledge-base` | `knowledge-base.py` |
-| `skills/knowledge-base-rag` | `/knowledge-base-rag` | `knowledge-base-rag.py` |
-| `skills/ms-excel` | `/ms-excel` | `ms-excel.py` |
-| `skills/ms-outlook` | `/ms-outlook` | `ms-outlook.py` |
-| `skills/ms-word` | `/ms-word` | `ms-word.py` |
-| `skills/pdf-to-md` | `/pdf-to-md` | `pdf-to-md.py` |
+| `skills/confluence.md` | `/confluence` | `confluence.py` |
+| `skills/jira.md` | `/jira` | `jira.py` |
+| `skills/knowledge-base.md` | `/knowledge-base` | `knowledge-base.py` |
+| `skills/ms-excel.md` | `/ms-excel` | `ms-excel.py` |
+| `skills/ms-outlook.md` | `/ms-outlook` | `ms-outlook.py` |
+| `skills/ms-word.md` | `/ms-word` | `ms-word.py` |
+| `skills/pdf-to-md.md` | `/pdf-to-md` | `pdf-to-md.py` |
 
 ### Installing the skills
 
-- **Claude Code**: copy each `skills/<name>` folder into your project's
-  `.claude/skills/` (or `%USERPROFILE%\.claude\skills\` for all projects).
-  Claude invokes them automatically when relevant, and `/<name>` triggers
-  one explicitly.
-- **Cline**: Cline's slash commands are *workflows* — copy each skill's
-  `SKILL.md` into your workspace as `.clinerules/workflows/<name>.md`
+- **Claude Code**: skills live in a folder per name, so copy each
+  `skills/<name>.md` into your project's `.claude/skills/<name>/SKILL.md`
+  (or under `%USERPROFILE%\.claude\skills\` for all projects). Claude invokes
+  them automatically when relevant, and `/<name>` triggers one explicitly.
+- **Cline**: Cline's slash commands are *workflows* — copy each
+  `skills/<name>.md` into your workspace as `.clinerules/workflows/<name>.md`
   (e.g. `.clinerules/workflows/ms-word.md`), then type `/ms-word.md` in
   Cline to run it. The frontmatter is harmless there. To have Cline apply a
   skill automatically (no slash command), drop it into `.clinerules/`
   instead of `.clinerules/workflows/`.
-- **Continue**: add each `SKILL.md` body as a prompt file (Continue's
+- **Continue**: add each `skills/<name>.md` body as a prompt file (Continue's
   `prompts:` / *.prompt files) if you want `/`-invocable equivalents; the
   files are plain Markdown, so they paste in unchanged.
 

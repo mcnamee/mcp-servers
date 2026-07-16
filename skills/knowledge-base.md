@@ -1,14 +1,14 @@
 ---
-name: knowledge-base-rag
-description: Answer questions from the local knowledge base with true vector RAG via the kb-rag MCP server. Use when the user asks a question their policies/docs should answer ("can I…", "what's our policy on…"), or asks to index new documents or check index freshness.
+name: knowledge-base
+description: Answer questions from the local knowledge base with true vector RAG via the knowledge-base MCP server. Use when the user asks a question their policies/docs should answer ("can I…", "what's our policy on…"), or asks to index new documents or check index freshness.
 ---
 
-# RAG knowledge base (via the `kb-rag` MCP server)
+# Knowledge base (via the `knowledge-base` MCP server)
 
-Requires the `knowledge-base-rag.py` MCP server (ChromaDB vector index +
+Requires the `knowledge-base.py` MCP server (ChromaDB vector index +
 your embeddings endpoint). If its tools are not available, tell the user to
 wire it in first (see the repo README) and to verify with
-`python knowledge-base-rag.py --check`, then `--reindex`.
+`python knowledge-base.py --check`, then `--reindex`.
 
 ## Tools
 
