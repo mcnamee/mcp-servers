@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-ms-word.py (v2.1.0) - A single-file MCP (Model Context Protocol) stdio server
+ms-word.py (v2.2.0) - A single-file MCP (Model Context Protocol) stdio server
 that gives an AI agent read/search/edit/generate access to Word .docx files.
 
 It follows a simple open -> edit -> save workflow (msword_open ... msword_save),
@@ -15,8 +15,10 @@ WHAT IT CAN DO
       match is tried (so "budget policy" opens "Budget Policy 2024.docx"), and
       the result is flagged (fuzzy_matched) so the caller can confirm the pick.
       List what is available with msword_list_documents.
-    - Create a NEW .docx from scratch (msword_create) in a configurable output
-      folder, then build it up with the add_/insert_ tools and save it.
+    - Create a NEW .docx (msword_create) in a configurable output folder, then
+      build it up with the add_/insert_ tools and save it. Optionally base it on
+      an existing document via 'template' - its styles, headers/footers and
+      boilerplate are inherited and the template file is left untouched.
     - On open, optionally MIRROR the document to Markdown into a knowledge-base
       folder for a local RAG index (the same idea as confluence.py's --kb-dir):
       headings, bullet/numbered lists and tables are converted; files are named
@@ -182,7 +184,7 @@ failed transfer" rule):
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # =============================================================================
 # CONFIGURATION  (all user-editable settings live here, nothing scattered below)
@@ -1380,13 +1382,20 @@ def _save_to_kb(doc, source_path):
 # =============================================================================
 # TOOL HANDLERS  (each takes an `args` dict, returns a JSON-serialisable object)
 # =============================================================================
-def tool_open(args):
-    raw = _require(args, "path")
+def _resolve_existing_docx(raw):
+    """
+    Resolve a caller-supplied name/path to an EXISTING .docx under the permitted
+    roots, using the forgiving chain shared by msword_open and the template
+    option of msword_create: sandbox-resolve the path against the document root,
+    then (if not found) an exact basename lookup, then a fuzzy name match.
+    Returns (path, fuzzy_matched). Raises ToolError if nothing matches, the name
+    is ambiguous, or the resolved file is not a .docx.
+    """
     path = _resolve_path(raw)
     fuzzy_matched = False
     if not os.path.isfile(path):
         # Not at the resolved location. Fall back to a basename lookup anywhere
-        # under the permitted roots, so "Policy 103.docx" opens even when it
+        # under the permitted roots, so "Policy 103.docx" resolves even when it
         # lives in a subfolder of the document root.
         matches = _find_docx_by_name(raw)
         if len(matches) == 1:
@@ -1394,7 +1403,7 @@ def tool_open(args):
         elif len(matches) > 1:
             listing = ", ".join(_display_path(m) for m in matches)
             raise ToolError(
-                "Several documents are named '{}': {}. Re-open with the path "
+                "Several documents are named '{}': {}. Use the path "
                 "(relative to the document root) to pick one.".format(
                     os.path.basename(raw.replace("\\", "/")), listing)
             )
@@ -1410,7 +1419,7 @@ def tool_open(args):
                 listing = ", ".join(_display_path(m) for m in tied)
                 raise ToolError(
                     "'{}' matches several documents about equally well: {}. "
-                    "Re-open with the exact name or path, or call "
+                    "Use the exact name or path, or call "
                     "msword_list_documents.".format(raw, listing)
                 )
             else:
@@ -1421,6 +1430,12 @@ def tool_open(args):
                 )
     if not path.lower().endswith(".docx"):
         raise ToolError("Only .docx files are supported (got: {})".format(path))
+    return path, fuzzy_matched
+
+
+def tool_open(args):
+    raw = _require(args, "path")
+    path, fuzzy_matched = _resolve_existing_docx(raw)
     if len(SESSIONS) >= MAX_SESSIONS:
         raise ToolError(
             "Too many open sessions ({}). Close some with msword_close.".format(
@@ -1498,9 +1513,15 @@ def tool_list_documents(args):
 
 def tool_create(args):
     """
-    Create a NEW blank .docx in the output folder, open it as a session and
-    return the session_id. The model then builds it up with the add_/insert_
-    tools and persists it with msword_save (in place, or save-as elsewhere).
+    Create a NEW .docx in the output folder, open it as a session and return the
+    session_id. The model then builds it up with the add_/insert_ tools and
+    persists it with msword_save (in place, or save-as elsewhere).
+
+    With no 'template', the new document is blank. With 'template' set to an
+    existing document's name/path (resolved within the document root exactly as
+    msword_open resolves it), that document is loaded as the starting point -
+    inheriting its styles, headers/footers, page setup and any boilerplate - and
+    the new file is saved to the OUTPUT folder, leaving the template untouched.
     """
     filename = _require(args, "filename")
     if not isinstance(filename, str) or not filename.strip():
@@ -1539,7 +1560,29 @@ def tool_create(args):
             "File already exists: {} (pass overwrite=true to replace it).".format(target)
         )
 
-    doc = docx.Document()
+    # Optional template: load an existing document as the starting point. It is
+    # resolved within the document root (same forgiving matching as msword_open)
+    # and only READ - the new document is saved to `target` in the output folder,
+    # so the template file itself is never modified.
+    template = args.get("template")
+    template_used = None
+    if template is not None and str(template).strip():
+        tmpl_path, _fuzzy = _resolve_existing_docx(str(template))
+        # Guard against a template that resolves to the create target itself.
+        if os.path.realpath(tmpl_path) == os.path.realpath(target):
+            raise ToolError("template and the new file resolve to the same path.")
+        try:
+            doc = docx.Document(tmpl_path)
+        except PackageNotFoundError:
+            raise ToolError(
+                "Template is not a valid .docx file: {}".format(tmpl_path)
+            )
+        except PermissionError:
+            raise ToolError("Permission denied reading template: {}".format(tmpl_path))
+        template_used = _display_path(tmpl_path)
+    else:
+        doc = docx.Document()
+
     title = args.get("title")
     if title:
         # Seed the document with a Title so the file is not empty on first save.
@@ -1556,14 +1599,18 @@ def tool_create(args):
 
     sid = uuid.uuid4().hex[:12]
     SESSIONS[sid] = {"path": target, "doc": doc, "opened_at": _now_iso()}
-    log("created {} as session {}".format(target, sid))
-    return {
+    log("created {} as session {}{}".format(
+        target, sid, " from template {}".format(template_used) if template_used else ""))
+    result = {
         "session_id": sid,
         "path": target,
         "created": True,
         "paragraphs": len(doc.paragraphs),
         "tables": len(doc.tables),
     }
+    if template_used:
+        result["template"] = template_used
+    return result
 
 
 def tool_close(args):
@@ -2115,12 +2162,13 @@ TOOLS = [
     },
     {
         "name": "msword_create",
-        "description": "Create a NEW blank .docx in the server's output folder (set with --output-dir, separate from the knowledge-base folder; falls back to the document root) and open it as a session. Supply just a 'filename' (a '.docx' extension is added if missing; any folder part is ignored so files always land in the output folder). Optionally pass 'title' to seed a Title heading. Then build the document with msword_add_heading/msword_add_paragraph/msword_add_table etc. and persist it with msword_save (omit its 'path' to save in place in the output folder).",
+        "description": "Create a NEW .docx in the server's output folder (set with --output-dir, separate from the knowledge-base folder; falls back to the document root) and open it as a session. Supply just a 'filename' (a '.docx' extension is added if missing; any folder part is ignored so files always land in the output folder). Pass 'template' to base the new document on an existing one (a document name/path resolved within the document root, matched the same forgiving way as msword_open): its styles, headers/footers, page setup and boilerplate are inherited and the template file itself is never modified. Optionally pass 'title' to seed a Title heading (usually omitted when using a template that already has its own title). Then build the document with msword_add_heading/msword_add_paragraph/msword_add_table etc. and persist it with msword_save (omit its 'path' to save in place in the output folder).",
         "handler": tool_create,
         "inputSchema": {
             "type": "object",
             "properties": {
                 "filename": {"type": "string", "description": "Name for the new file, e.g. 'status-report.docx'. Any directory part is stripped; the file is created in the configured output folder."},
+                "template": {"type": "string", "description": "Optional: name or path of an existing .docx (in the document root) to use as the starting template, e.g. 'Report Template.docx'. Resolved like msword_open (relative to the document root, with fuzzy matching). The template is only read; the new file is saved to the output folder."},
                 "title": {"type": "string", "description": "Optional text for a Title heading added to the new document."},
                 "overwrite": {"type": "boolean", "default": False, "description": "Replace the file if it already exists (default false = error out)."},
             },
@@ -2951,6 +2999,41 @@ def run_check():
         except ToolError:
             pass
         tool_close({"session_id": csid})
+
+        # Create FROM A TEMPLATE: a template in the docs root is loaded as the
+        # base, the new file lands in the output folder, and the template file
+        # itself is never modified.
+        tmpl_path = os.path.join(tmpdir, "Letter Template.docx")
+        tdoc = docx.Document()
+        tdoc.add_heading("ACME CORP", level=0)
+        tdoc.add_paragraph("TEMPLATE-BOILERPLATE-MARKER")
+        tdoc.save(tmpl_path)
+        tcre = tool_create({"filename": "Client Letter.docx",
+                            "template": "letter template"})  # fuzzy/bare name
+        assert tcre["created"] and tcre.get("template"), \
+            "template not recorded in result: {}".format(tcre)
+        assert os.path.dirname(tcre["path"]) == os.path.realpath(out_dir), \
+            "templated doc not written to the output folder"
+        ttext = tool_get_content({"session_id": tcre["session_id"],
+                                  "mode": "text"})["content"]
+        assert "TEMPLATE-BOILERPLATE-MARKER" in ttext, \
+            "template content was not inherited"
+        tool_add_paragraph({"session_id": tcre["session_id"], "text": "Dear customer,"})
+        tool_save({"session_id": tcre["session_id"]})  # save in place (the copy)
+        tool_close({"session_id": tcre["session_id"]})
+        # The template file must be untouched by all of the above.
+        reo = tool_open({"path": tmpl_path})
+        tmpl_text = tool_get_content({"session_id": reo["session_id"],
+                                      "mode": "text"})["content"]
+        assert "Dear customer," not in tmpl_text, "the template file was modified!"
+        tool_close({"session_id": reo["session_id"]})
+        # A template name that matches nothing errors clearly.
+        try:
+            tool_create({"filename": "x.docx", "template": "zzzznomatchqqqq"})
+            raise AssertionError("expected a template-not-found error")
+        except ToolError:
+            pass
+
         OUTPUT_DIR = None
         print("[check] create-new-document: PASS")
 

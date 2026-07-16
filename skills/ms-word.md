@@ -1,6 +1,6 @@
 ---
 name: ms-word
-description: Read, edit and create Word .docx files via the msword MCP server, including Word tracked changes. Use when the user asks to open/summarise/search a Word document, edit or redline one with tracked changes, accept/reject revisions, or draft a new .docx.
+description: Read, edit and create Word .docx files via the msword MCP server, including Word tracked changes and creating documents from a template. Use when the user asks to open/summarise/search a Word document, edit or redline one with tracked changes, accept/reject revisions, or draft a new .docx (optionally from a template).
 ---
 
 # Word (via the `msword-py` MCP server)
@@ -38,6 +38,25 @@ verify with `python ms-word.py --check`.
 `msword_create` makes a new .docx (written to the configured output folder)
 and opens it as a session — build it with the add_* tools, then
 `msword_save`. Directory parts in the requested filename are stripped.
+
+### From a template
+
+To start from a defined template (a letterhead, report layout, contract
+boilerplate, etc.), pass `template` to `msword_create`:
+
+- `msword_create` with `filename: "Q3 Report.docx"` and
+  `template: "Report Template.docx"`. The template is an existing `.docx` in
+  the docs folder, resolved the same forgiving way as `msword_open` (bare name,
+  relative path, or a fuzzy near-miss). Its styles, headers/footers, page setup
+  and boilerplate are inherited into the new file, which is written to the
+  output folder. The template file itself is never modified, and the result
+  includes `template` (the resolved template) so you can confirm the right one
+  was used.
+- Then edit and `msword_save` as usual. Omit `title` when the template already
+  carries its own title.
+- To discover available templates, use `msword_list_documents` (e.g.
+  `query: "template"`); keep templates in the docs folder (a `templates/`
+  subfolder is a tidy convention). Only `.docx` templates are supported.
 
 ## Notes
 

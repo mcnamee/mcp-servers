@@ -1,6 +1,6 @@
 ---
 name: pdf-to-md
-description: Convert PDFs to Markdown via the pdf2md MCP server (tables included). Use when the user asks to convert PDF files to Markdown, or to make PDFs searchable by the knowledge-base servers.
+description: Convert PDFs to Markdown via the pdf2md MCP server (tables included). Use when the user asks to convert PDF files to Markdown, or to make PDFs searchable by the knowledge-base server.
 ---
 
 # PDF → Markdown (via the `pdf2md` MCP server)
