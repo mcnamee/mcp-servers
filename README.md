@@ -19,7 +19,7 @@ for the bump rules.
 | `jira.py` | 1.1.0 | _none_ | standard library only (read-only, Jira Data Center v2 REST API) |
 | `knowledge-base.py` | 2.0.0 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
 | `ms-excel.py` | 2.1.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
-| `ms-word.py` | 2.2.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
+| `ms-word.py` | 2.3.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
 | `ms-outlook.py` | 1.5.1 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
 | `pdf-to-md.py` | 4.0.0 | `pip install pymupdf pymupdf4llm` | OCR of scanned PDFs additionally requires Tesseract installed on the machine (not a pip package) |
 
@@ -426,6 +426,19 @@ includes the resolved `template` so you can confirm the right one was used.
 `.docx` templates only; keep them in the docs folder (a `templates/` subfolder
 is a tidy convention, discoverable via `msword_list_documents`).
 
+**Filling out an example template.** When the template is a form to fill in —
+placeholder text plus an *example* table (e.g. an agenda with a Time/Item/Owner
+table) — the table-editing tools let an agent populate it. Read the structure
+with `msword_get_content` (`mode: "structured"`) and `msword_get_tables`, swap
+placeholder text with `msword_replace_text` (templates that use explicit
+`{{TOKEN}}` markers are the most reliable to fill), then for the repeating table:
+`msword_add_table_row` (with `copy_from_row` to clone a styled example row's
+borders/shading/fonts, and `values` to fill it) once per real item,
+`msword_set_cell` to set an individual cell by `(table_index, row, col)`, and
+`msword_delete_table_row` to drop leftover example rows (delete highest index
+first, since indices shift). These table edits are plain (untracked); a table
+row/cell change can't be a Word tracked change.
+
 Tracked changes are recorded the way Word itself records them: replacements
 are diffed **word-by-word** (only the words that actually change are marked
 as deleted/inserted — never "whole paragraph deleted + whole paragraph
@@ -670,19 +683,21 @@ one or more of the tools the server exposes.
 5. "Open every .docx in my docs folder so it gets mirrored into the RAG knowledge base as Markdown." → `msword_open` with `--kb-dir` set (each open writes `Word - <name>.md` next to the Confluence pages for `knowledge-base.py` to index)
 6. "Create a new status report document and draft it with a title, headings and a summary table, then save it to my generated-docs folder." → `msword_create` (writes to `--output-dir`) + `msword_add_heading` + `msword_add_paragraph` + `msword_add_table` + `msword_save`
 7. "Create a Q3 report from my report template." → `msword_create` with `template: "Report Template.docx"` (inherits the template's styles/headers/boilerplate into a new file in the output folder; the template is left untouched) + the add_* tools + `msword_save`
-8. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
-9. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
-10. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
-11. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
-12. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
-13. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
-14. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
-15. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
-16. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
-17. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
-18. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
-19. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
-20. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
+8. "Use my agenda template and fill it out for Monday's meeting — one row per item." → `msword_create` with `template: "Agenda Template.docx"` + `msword_replace_text` (placeholders) + `msword_add_table_row` (with `copy_from_row` to clone the example row) per item + `msword_set_cell` + `msword_delete_table_row` (drop leftover example rows) + `msword_save`
+9. "Find every mention of 'Acme Corp' in the contract and replace it with 'Acme Corporation'." → `msword_search` + `msword_replace_text`
+10. "Add a 'Next Steps' heading and a summary paragraph to the end of the report, then save it." → `msword_add_heading` + `msword_add_paragraph` + `msword_save`
+11. "Pull out the data from every table in the document as structured rows." → `msword_get_tables`
+12. "Add a 3x4 pricing table to the end of the quote document with these values, using the 'Table Grid' style." → `msword_add_table` + `msword_save`
+13. "Fill cell B2 of the second table with 'Approved', and add a row for the new line item." → `msword_set_cell` + `msword_add_table_row`
+14. "Change 'DRAFT' to 'FINAL' throughout the report as a tracked change so it shows up as a Word revision for review." → `msword_replace_text` with `track_changes=true`
+15. "Rewrite the third paragraph to be more concise, showing your edits as tracked changes — only mark the words you actually changed." → `msword_set_paragraph_text` with `track_changes=true` (old vs new text is diffed word-by-word, like editing in Word with Track Changes on)
+16. "Add a new paragraph after the introduction as a tracked insertion, so reviewers can reject it if they disagree." → `msword_insert_paragraph` with `track_changes=true`
+17. "Delete the whole limitation-of-liability paragraph as a tracked change — struck out, so legal can accept or reject it." → `msword_delete_paragraph` with `track_changes=true`
+18. "What tracked changes are currently in this document, and who made them?" → `msword_list_changes`
+19. "Accept Jane's two changes in the pricing section but leave everything else pending." → `msword_list_changes` + `msword_accept_changes` with those change ids
+20. "Reject just the change that deleted the warranty sentence." → `msword_list_changes` + `msword_reject_changes` with that change id
+21. "Accept all the tracked changes in this document now that legal has signed off." → `msword_accept_all_changes`
+22. "Reject all the tracked changes and revert this document to its original wording." → `msword_reject_all_changes`
 
 ### pdf-to-md.py
 
