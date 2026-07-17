@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ms-outlook.py (v1.5.1)
+ms-outlook.py (v2.0.0)
 ======================
 
 A single-file MCP (Model Context Protocol) server giving an LLM read-only
@@ -29,7 +29,13 @@ TOOLS EXPOSED (all read-only)
 - outlook_list_recent_emails : recent Inbox messages
 - outlook_search_emails      : search Inbox by subject / sender
 - outlook_get_email          : full body of one message by EntryID
-- outlook_get_calendar       : calendar events in a date range (recurring expanded)
+- outlook_get_calendar       : calendar events in a date range (recurring expanded).
+                               Date filtering happens in Python, NOT via Outlook's
+                               locale-sensitive Restrict(), so it works identically
+                               under any regional date settings. When no events
+                               match, the reply includes a [debug] section showing
+                               the last 5 calendar items scanned (start date +
+                               in-range flag) so a filtering fault stays visible.
 - outlook_list_sent_emails   : messages you SENT, in a date range (e.g. "what did I do last week")
 - outlook_search_recent      : all mail across Inbox/Archive/Sent in a date range (configurable)
 - outlook_list_folders       : list every mail folder across all stores (to configure the above)
@@ -82,17 +88,11 @@ just below this docstring. Edit them there; nothing else needs changing.
                    punctuation (e.g. "[SEC=PROTECTED]") that word mode misses.
    Matching is always case-insensitive.
 
-3. RESTRICT_DATE_FORMAT  (LOCALE-SENSITIVE - read this if calendar returns nothing)
-   Outlook's Restrict() date filter formats dates per the machine's regional
-   settings. Default is US (MM/DD/YYYY). If outlook_get_calendar returns ZERO
-   events on an Australian-locale machine, switch to a day-first format - the
-   alternatives are listed inline in the config block.
-
-4. Tunable caps (MAX_BODY_CHARS / CALENDAR_HARD_CAP / SEARCH_SCAN_CAP)
+3. Tunable caps (MAX_BODY_CHARS / CALENDAR_HARD_CAP / SEARCH_SCAN_CAP)
    Safety/size limits. Lower MAX_BODY_CHARS if your local model has a small
    context window. The other two are guard rails you can usually leave as-is.
 
-5. SEARCH_ALL_FOLDERS  (DEFAULT folders the combined outlook_search_recent covers)
+4. SEARCH_ALL_FOLDERS  (DEFAULT folders the combined outlook_search_recent covers)
    A list of folder NAMES matched across every store in the profile (main
    mailbox, online archive, mounted PST). Default: Inbox, Sent Items, Archive.
    "Archive" is ambiguous - it may be a mailbox folder, an online archive, or a
@@ -157,7 +157,7 @@ IMPORTANT (stdio-on-Windows pitfalls)
 
 # Semantic version of this server. Bump on EVERY change (see CLAUDE.md):
 # MAJOR = breaking config/tool change, MINOR = new feature, PATCH = fix.
-__version__ = "1.5.1"
+__version__ = "2.0.0"
 
 import os
 import re
@@ -189,18 +189,12 @@ BLACKLIST_MATCH_MODE = "word"
 #         disable filtering.
 REQUIRE_BLACKLIST = False
 
-# --- 3. Calendar date filter format (LOCALE-SENSITIVE). If outlook_get_calendar
-#        returns nothing on an AU-locale machine, switch to one of the alternatives.
-RESTRICT_DATE_FORMAT = "%m/%d/%Y %I:%M %p"          # US:  MM/DD/YYYY hh:mm AM/PM (default)
-# RESTRICT_DATE_FORMAT = "%d/%m/%Y %I:%M %p"        # AU:  DD/MM/YYYY hh:mm AM/PM   <- try this
-# RESTRICT_DATE_FORMAT = "%d/%m/%Y %H:%M"           # AU 24-hour, no AM/PM          <- or this
-
-# --- 4. Tunable caps.
+# --- 3. Tunable caps.
 MAX_BODY_CHARS = 20000      # truncate very long email bodies for the LLM
-CALENDAR_HARD_CAP = 1000    # ceiling on calendar items iterated (anti-runaway)
+CALENDAR_HARD_CAP = 1000    # ceiling on calendar events collected (anti-runaway)
 SEARCH_SCAN_CAP = 500       # ceiling on raw search hits scanned
 
-# --- 5. Folders included in the combined outlook_search_recent tool. Matched by
+# --- 4. Folders included in the combined outlook_search_recent tool. Matched by
 #        folder NAME (case-insensitive) across EVERY mailbox/store in the profile,
 #        including an online (In-Place) archive or a mounted archive.pst. Run the
 #        outlook_list_folders tool to see the exact names available, then edit this
@@ -208,7 +202,7 @@ SEARCH_SCAN_CAP = 500       # ceiling on raw search hits scanned
 #        unaffected by this list.)
 SEARCH_ALL_FOLDERS = ["Inbox", "Sent Items", "Archive"]
 
-# --- 6. KB_DIR  (optional Markdown export for a local RAG knowledge base).
+# --- 5. KB_DIR  (optional Markdown export for a local RAG knowledge base).
 #        If set, EVERY email read with outlook_get_email is ALSO written out as
 #        a Markdown file into this folder, the same way confluence.py mirrors
 #        pages and ms-word.py mirrors documents, so the content can feed a local
@@ -1132,6 +1126,55 @@ def tool_search_recent(args):
     return header + "\n" + "\n".join(lines) + note
 
 
+def _expand_recurring_occurrences(item, start_dt, end_dt):
+    """All occurrences of a recurring appointment starting in [start_dt, end_dt].
+
+    Probes the series' RecurrencePattern day by day at the series' usual start
+    time (GetOccurrence raises for days with no/deleted occurrence, which is
+    normal and simply skipped), then adds rescheduled occurrences from the
+    pattern's Exceptions, since those no longer sit at the usual time. Pure
+    COM object access - no locale-sensitive date strings anywhere.
+
+    Returns a list of (naive start datetime, AppointmentItem occurrence).
+    """
+    try:
+        pattern = item.GetRecurrencePattern()
+    except Exception:
+        return []
+
+    master_start = _com_to_naive(item.Start)
+    base_time = master_start.time() if master_start else datetime.time(0, 0)
+
+    found = {}  # start datetime -> occurrence (dedups probe vs exception hits)
+    day = start_dt.date()
+    while day <= end_dt.date():
+        probe = datetime.datetime.combine(day, base_time)
+        try:
+            occ = pattern.GetOccurrence(probe)
+            occ_start = _com_to_naive(occ.Start)
+            if occ_start is not None and start_dt <= occ_start <= end_dt:
+                found[occ_start] = occ
+        except Exception:
+            pass  # no occurrence on this day
+        day = day + datetime.timedelta(days=1)
+
+    try:
+        for exception in pattern.Exceptions:
+            try:
+                if bool(exception.Deleted):
+                    continue
+                occ = exception.AppointmentItem
+                occ_start = _com_to_naive(occ.Start)
+                if occ_start is not None and start_dt <= occ_start <= end_dt:
+                    found[occ_start] = occ
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return list(found.items())
+
+
 def tool_get_calendar(args):
     today = datetime.date.today()
     try:
@@ -1146,32 +1189,70 @@ def tool_get_calendar(args):
     max_results = int(args.get("max_results", 50))
 
     start_dt = datetime.datetime.combine(start_date, datetime.time(0, 0))
-    end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59))
+    end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
 
     ns = get_namespace()
     cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR)
     items = cal.Items
 
-    # Order matters for expanding recurring appointments: Sort -> IncludeRecurrences -> Restrict.
-    items.Sort("[Start]")
-    items.IncludeRecurrences = True
-
-    restriction = (
-        "[Start] >= '" + start_dt.strftime(RESTRICT_DATE_FORMAT) + "' AND "
-        "[Start] <= '" + end_dt.strftime(RESTRICT_DATE_FORMAT) + "'"
-    )
+    # NO Outlook-side filtering here. Restrict() formats its date strings per
+    # the machine's regional settings (US vs AU) and misbehaves with recurring
+    # appointments, silently returning 0 results on some machines. Instead the
+    # whole collection is walked by index (Item(i) is more reliable than COM
+    # enumeration) and filtered in Python, which is locale-independent.
     try:
-        restricted = items.Restrict(restriction)
+        total = int(items.Count)
     except Exception as exc:
-        return "Error: Outlook rejected the calendar filter ({0}).".format(exc)
+        return "Error: could not read the calendar folder ({0}).".format(exc)
+
+    matches = []      # (naive start datetime, appointment COM object)
+    debug_tail = []   # rolling last-5 raw items: (index, start-or-None, matched?)
+
+    for i in range(1, total + 1):
+        try:
+            item = items.Item(i)
+        except Exception:
+            continue
+
+        try:
+            item_start = _com_to_naive(item.Start)
+        except Exception:
+            item_start = None
+
+        try:
+            is_recurring = bool(item.IsRecurring)
+        except Exception:
+            is_recurring = False
+
+        if is_recurring:
+            # A recurring master's own Start is its FIRST occurrence, usually
+            # far outside the window - expand the series instead of testing it.
+            occurrences = _expand_recurring_occurrences(item, start_dt, end_dt)
+            matched = bool(occurrences)
+            matches.extend(occurrences)
+        else:
+            matched = item_start is not None and start_dt <= item_start <= end_dt
+            if matched:
+                matches.append((item_start, item))
+
+        # Rolling tail for the debug section shown when nothing matches.
+        # Start date + flag only; subjects are deliberately omitted so the
+        # content blacklist cannot leak through this path.
+        debug_tail.append((i, item_start, matched))
+        if len(debug_tail) > 5:
+            debug_tail.pop(0)
+
+        if len(matches) >= CALENDAR_HARD_CAP:
+            break
+
+    # Outlook's Sort() is no longer used; order in Python instead.
+    matches.sort(key=lambda pair: pair[0])
 
     lines = []
     withheld = 0
-    iterated = 0
-    for item in restricted:
-        if iterated >= CALENDAR_HARD_CAP or len(lines) >= max_results:
+    for item_start, item in matches:
+        if len(lines) >= max_results:
             break
-        iterated += 1
 
         # Compliance filter.
         reason = appointment_block_reason(item)
@@ -1184,7 +1265,7 @@ def tool_get_calendar(args):
             all_day = bool(item.AllDayEvent)
             when = "{start} -> {end}".format(start=fmt_dt(item.Start), end=fmt_dt(item.End))
             if all_day:
-                when = "{0} (all day)".format(item.Start.strftime("%Y-%m-%d"))
+                when = "{0} (all day)".format(item_start.strftime("%Y-%m-%d"))
             recur = " [recurring]" if bool(item.IsRecurring) else ""
             location = ""
             try:
@@ -1219,7 +1300,20 @@ def tool_get_calendar(args):
         if withheld:
             return "No viewable events between {0} and {1}. {2} event(s) were withheld by the content blacklist.".format(
                 start_date, end_date, withheld)
-        return "No calendar events between {0} and {1}.".format(start_date, end_date)
+        # Debug section: prove what was actually scanned, so a filtering
+        # regression is visible instead of looking like an empty calendar.
+        msg = "No calendar events between {0} and {1}.".format(start_date, end_date)
+        msg += "\n\n[debug] Calendar folder holds {0} item(s); {1} matched the date range.".format(
+            total, len(matches))
+        if debug_tail:
+            msg += "\n[debug] Last {0} item(s) in the folder (start / in range?):".format(
+                len(debug_tail))
+            for idx, dbg_start, dbg_matched in debug_tail:
+                msg += "\n  - item {0}: start={1}, match={2}".format(
+                    idx,
+                    dbg_start.strftime("%Y-%m-%d %H:%M") if dbg_start else "(unreadable)",
+                    "yes" if dbg_matched else "no")
+        return msg
     header = "Calendar events {0} to {1} ({2} shown):".format(start_date, end_date, len(lines))
     return header + "\n" + "\n".join(lines) + note
 
@@ -1281,9 +1375,11 @@ TOOLS = [
     {
         "name": "outlook_get_calendar",
         "description": (
-            "List calendar events between two dates (inclusive). Recurring meetings "
-            "are expanded into individual occurrences. Dates are YYYY-MM-DD; defaults "
-            "to today through 7 days ahead. Some events may be withheld by a content policy."
+            "List calendar events between two dates (inclusive), sorted by start time. "
+            "Recurring meetings are expanded into individual occurrences. Dates are "
+            "YYYY-MM-DD; defaults to today through 7 days ahead. Some events may be "
+            "withheld by a content policy. If nothing matches, the reply includes a "
+            "[debug] section listing the last few calendar items scanned."
         ),
         "inputSchema": {
             "type": "object",
