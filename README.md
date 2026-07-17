@@ -20,7 +20,7 @@ for the bump rules.
 | `knowledge-base.py` | 2.0.0 | `pip install chromadb` | true RAG: local ChromaDB vector index + your embeddings API (HTTP is stdlib `urllib`, no `requests`) |
 | `ms-excel.py` | 2.1.0 | _none_ | standard library only (parses .xlsx as a zip of XML) |
 | `ms-word.py` | 2.3.0 | `pip install python-docx` | also pulls in `lxml` (compiled) and `typing_extensions` |
-| `ms-outlook.py` | 1.5.1 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
+| `ms-outlook.py` | 2.0.0 | `pip install pywin32` | Windows only (COM automation of classic Outlook) |
 | `pdf-to-md.py` | 4.0.0 | `pip install pymupdf pymupdf4llm` | OCR of scanned PDFs additionally requires Tesseract installed on the machine (not a pip package) |
 
 ## Install everything at once
@@ -351,7 +351,6 @@ for these):
 |---|---|
 | `BLACKLIST_TERMS` | Built-in list of classification/compliance terms that cause an item to be withheld from the AI entirely |
 | `BLACKLIST_MATCH_MODE` | `"word"` (default, whole-term match) or `"substring"` (for terms containing punctuation) |
-| `RESTRICT_DATE_FORMAT` | Locale-sensitive date format Outlook expects in its `Restrict()` filter — switch this if `outlook_get_calendar` returns zero events on a non-US-locale machine |
 | `MAX_BODY_CHARS` / `CALENDAR_HARD_CAP` / `SEARCH_SCAN_CAP` | Safety caps on body length / items scanned |
 | `SEARCH_ALL_FOLDERS` | Folder names (matched across every store) that `outlook_search_recent` searches by default — `["Inbox", "Sent Items", "Archive"]`; use `outlook_list_folders` to see real folder names first. This is only the built-in default: override it at launch with `--search-folders`, or per call by passing a `folders` argument to `outlook_search_recent` |
 

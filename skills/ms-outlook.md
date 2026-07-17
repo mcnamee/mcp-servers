@@ -39,6 +39,8 @@ user to wire it in first (see the repo README) and to verify with
 - A compliance blacklist may withhold messages/folders entirely; blocked
   items appear only as a withheld count. Do not speculate about their
   content, and never try to work around the filter.
-- Calendar queries returning zero events on a non-US locale may need the
-  `RESTRICT_DATE_FORMAT` constant adjusted in the file — mention it if
-  results look impossibly empty.
+- Calendar date filtering is done in Python (locale-independent), so
+  regional date settings cannot empty the results. If `outlook_get_calendar`
+  finds nothing, its reply includes a `[debug]` section listing the last few
+  calendar items scanned (start date + in-range flag) — read it to tell an
+  actually-empty window apart from a filtering fault before retrying.
